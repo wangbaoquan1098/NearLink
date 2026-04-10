@@ -1,0 +1,53 @@
+name: nearlink
+description: "NearLink - 跨平台蓝牙文件互传应用，无网络也能传"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # 蓝牙通信
+  flutter_blue_plus: ^1.36.0
+
+  # NFC (Android)
+  nfc_manager: ^3.5.0
+
+  # 文件选择与处理
+  file_picker: ^8.0.0
+  image_picker: ^1.1.2  # iOS 相册选择
+  path_provider: ^2.1.2
+
+  # 图片压缩
+  flutter_image_compress: ^2.1.0
+
+  # 分享 (AirDrop)
+  share_plus: ^9.0.0
+
+  # 状态管理
+  provider: ^6.1.1
+
+  # 本地存储
+  shared_preferences: ^2.2.2
+
+  # UUID 生成
+  uuid: ^4.3.3
+
+  # 权限管理
+  permission_handler: ^11.3.0
+
+  # 文件类型识别
+  mime: ^1.0.5
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
