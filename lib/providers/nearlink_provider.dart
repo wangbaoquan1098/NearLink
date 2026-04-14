@@ -233,7 +233,7 @@ class NearLinkProvider extends ChangeNotifier {
     // 2. 检查是否有新的接收中的传输，只在首次检测到时触发界面跳转
     if (activeTransfers.isNotEmpty) {
       final receivingTransfers = activeTransfers.where(
-        (t) => t.filePath.isEmpty && t.status == TransferStatus.transferring
+        (t) => !t.isOutgoing && t.status == TransferStatus.transferring
       ).toList();
       
       for (final transfer in receivingTransfers) {

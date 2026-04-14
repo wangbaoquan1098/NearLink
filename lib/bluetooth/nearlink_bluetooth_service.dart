@@ -196,6 +196,8 @@ class NearLinkBluetoothService extends ChangeNotifier {
                 _onDataReceived(data);
               }
               break;
+              
+
           }
         }
       },
@@ -588,6 +590,9 @@ class NearLinkBluetoothService extends ChangeNotifier {
       // 连接成功，重置广播超时以维持广播
       _resetAdvertiseTimeout();
 
+      // 添加连接状态监听，以便在连接断开时及时检测
+      _startConnectionStateListener();
+
       return true;
     } on TimeoutException {
       _errorMessage = '连接超时，请确保设备在附近且蓝牙已开启';
@@ -602,6 +607,40 @@ class NearLinkBluetoothService extends ChangeNotifier {
       await _cleanupConnection();
       return false;
     }
+  }
+  
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+  
+  /// 开始监听连接状态变化
+  void _startConnectionStateListener() {
+    // 取消之前的监听
+    _connectionStateSubscription?.cancel();
+    
+    if (_connectedDevice == null) return;
+    
+    // 监听连接状态变化
+    _connectionStateSubscription = _connectedDevice!.connectionState.listen(
+      (state) {
+        if (state == BluetoothConnectionState.disconnected) {
+          debugPrint('[NearLink] 连接状态监听: 连接已断开');
+          _connectionStateSubscription?.cancel();
+          _connectionStateSubscription = null;
+          
+          // 清理连接资源
+          _txCharacteristic = null;
+          _rxCharacteristic = null;
+          _rxSubscription?.cancel();
+          _rxSubscription = null;
+          _connectedDevice = null;
+          
+          _updateConnectionState(NearLinkConnectionState.disconnected);
+          notifyListeners();
+        }
+      },
+      onError: (error) {
+        debugPrint('[NearLink] 连接状态监听错误: $error');
+      },
+    );
   }
   
   /// 清理连接资源
@@ -811,30 +850,19 @@ class NearLinkBluetoothService extends ChangeNotifier {
   }
   
   /// iOS 作为 Peripheral 时发送数据（通过原生层）
+  /// iOS 作为 Peripheral 被 Android 连接时使用此方法
   Future<bool> _sendDataAsPeripheral(Uint8List data) async {
     try {
-      // 分块发送，使用最大chunk大小（BLE标准MTU上限512字节）
-      const int mtu = NearLinkConstants.maxChunkSize;
-      int offset = 0;
-      while (offset < data.length) {
-        final end = (offset + mtu < data.length) ? offset + mtu : data.length;
-        final chunk = data.sublist(offset, end);
-        
-        final success = await _androidChannel.invokeMethod<bool>('sendData', {
-          'data': chunk,
-        }) ?? false;
-        
-        if (!success) {
-          _errorMessage = '发送数据块失败';
-          return false;
-        }
-        
-        offset = end;
-        // 无延迟，由 BLE 协议栈控制发送速率
-      }
-      return true;
+      // 直接将数据发送给 iOS，让 iOS 自己分块和队列管理
+      // 这样可以减少 Flutter 和 iOS 之间的往返次数，提高效率
+      final success = await _androidChannel.invokeMethod<bool>('sendData', {
+        'data': data,
+      }) ?? false;
+      
+      return success;
     } catch (e) {
       _errorMessage = '发送失败: $e';
+      debugPrint('[NearLink] _sendDataAsPeripheral 发送失败: $_errorMessage');
       return false;
     }
   }

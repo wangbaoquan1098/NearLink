@@ -22,6 +22,9 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     // 连接的中心设备
     private var connectedCentrals: [CBCentral] = []
     
+    // 存储已协商的 MTU（用于优化发送大小）
+    private var negotiatedMtu: Int = 185  // iOS 默认 BLE MTU
+    
     // 发送队列（当准备队列满时暂存数据）
     private var pendingDataQueue: [Data] = []
     
@@ -287,37 +290,57 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
+        print("[BleAdvertiser] didSubscribeTo: central=\(central.identifier.uuidString), char=\(characteristic.uuid)")
+        
         // 记录连接的中心设备
         if !connectedCentrals.contains(where: { $0.identifier == central.identifier }) {
             connectedCentrals.append(central)
+            print("[BleAdvertiser] didSubscribeTo: added central to connectedCentrals (total: \(connectedCentrals.count))")
         }
         
         // 停止广播（有设备连接后不再广播）
         if isAdvertising {
             stopAdvertising()
+            print("[BleAdvertiser] didSubscribeTo: stopped advertising")
         }
+        
+        // 存储协商的 MTU
+        negotiatedMtu = central.maximumUpdateValueLength
+        print("[BleAdvertiser] didSubscribeTo: negotiated MTU = \(negotiatedMtu)")
         
         // 通知 Flutter 有设备连接
         let eventData: [String: Any] = [
             "event": "centralConnected",
             "centralId": central.identifier.uuidString,
-            "mtu": central.maximumUpdateValueLength
+            "mtu": negotiatedMtu
         ]
         eventSink?(eventData)
+        print("[BleAdvertiser] didSubscribeTo: sent centralConnected event to Flutter (pending queue: \(pendingDataQueue.count))")
+        
+        // 发送队列中的所有待处理数据
+        flushPendingDataQueue()
+    }
+    
+    /// 发送队列中的所有待处理数据
+    private func flushPendingDataQueue() {
+        print("[BleAdvertiser] flushPendingDataQueue: queue size = \(pendingDataQueue.count)")
+        while !pendingDataQueue.isEmpty {
+            let data = pendingDataQueue.removeFirst()
+            if !sendDataToCentrals(data) {
+                // 发送队列满了，停止发送（数据会继续在队列中）
+                print("[BleAdvertiser] flushPendingDataQueue: send failed, stopping flush")
+                break
+            }
+        }
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
-        // 移除断开的设备
-        connectedCentrals.removeAll { $0.identifier == central.identifier }
+        // 注意：取消订阅不等于断开连接，只是设备暂时不需要通知
+        // 不要移除设备，也不要通知断开，只记录日志
+        print("[BleAdvertiser] 中心设备 \(central.identifier.uuidString) 取消订阅，等待重新订阅...")
         
-        print("[BleAdvertiser] 中心设备取消订阅: \(central.identifier.uuidString), 剩余连接数: \(connectedCentrals.count)")
-        
-        // 通知 Flutter 设备断开
-        let eventData: [String: Any] = [
-            "event": "centralDisconnected",
-            "centralId": central.identifier.uuidString
-        ]
-        eventSink?(eventData)
+        // 不移除设备，因为它仍然连接着，只是暂时取消订阅
+        // 当设备重新订阅时，didSubscribeTo 会被调用
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didDisconnectCentral central: CBCentral, error: Error?) {
@@ -333,34 +356,64 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             "centralId": central.identifier.uuidString
         ]
         eventSink?(eventData)
+        
+        // 如果仍然有其他连接的设备，不需要重新广播
+        if !connectedCentrals.isEmpty {
+            print("[BleAdvertiser] 仍有 \(connectedCentrals.count) 个设备连接，不重新广播")
+            return
+        }
+        
+        // 所有设备都断开了，自动重新开始广播以便接收新的连接
+        // 这样用户不需要手动重新开启广播
+        if peripheralManager?.state == .poweredOn && !isAdvertising {
+            print("[BleAdvertiser] 自动重新开始广播")
+            startAdvertising(deviceName: pendingDeviceName)
+        }
     }
     
     /// 发送数据到已连接的中心设备
+    /// 数据会自动分块发送以适应 MTU
     func sendDataToCentrals(_ data: Data) -> Bool {
         guard let txChar = txCharacteristic else {
+            print("[BleAdvertiser] sendDataToCentrals: txCharacteristic is nil")
             return false
         }
         
         // 检查是否有已连接的中心设备
         if connectedCentrals.isEmpty {
+            print("[BleAdvertiser] sendDataToCentrals: no connected centrals, queueing data")
             pendingDataQueue.append(data)
             return false
         }
         
         let subscribers = txChar.subscribedCentrals
         if subscribers == nil || subscribers!.isEmpty {
+            print("[BleAdvertiser] sendDataToCentrals: no subscribers to TX char, queueing data")
+            pendingDataQueue.append(data)
+            // 即使没有订阅者，也返回 true 表示数据已入队
+            // 数据会在 Android 订阅后通过 didSubscribeTo -> flushPendingDataQueue 发送
+            return true
+        }
+        
+        // 检查蓝牙是否开启
+        if peripheralManager?.state != .poweredOn {
+            print("[BleAdvertiser] sendDataToCentrals: not powered on, queueing data")
             pendingDataQueue.append(data)
             return false
         }
         
         // 发送给所有订阅了该特征值的中心设备
+        // CoreBluetooth 会自动处理分块
         let didSend = peripheralManager?.updateValue(data, for: txChar, onSubscribedCentrals: nil) ?? false
         
         if !didSend {
+            print("[BleAdvertiser] sendDataToCentrals: updateValue returned false, queueing data")
             pendingDataQueue.append(data)
+            // 返回 true 表示数据已入队，等待 peripheralManagerIsReady 发送
+            return true
         }
         
-        return didSend
+        return true
     }
     
     /// 获取已连接的中心设备数量
@@ -374,11 +427,9 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     }
     
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
-        // 发送队列中的数据
-        if !pendingDataQueue.isEmpty {
-            let dataToSend = pendingDataQueue.removeFirst()
-            _ = sendDataToCentrals(dataToSend)
-        }
+        // 发送队列中的所有待处理数据
+        print("[BleAdvertiser] peripheralManagerIsReady: ready to send more data")
+        flushPendingDataQueue()
     }
     
     // MARK: - Helper

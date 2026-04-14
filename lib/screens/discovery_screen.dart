@@ -32,7 +32,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       final provider = context.read<NearLinkProvider>();
       
       _incomingConnectionSubscription = provider.onIncomingConnection.listen(
-        (event) => _showIncomingConnectionDialog(event),
+        (event) {
+          // 被动连接，静默处理，不显示任何提示
+        },
       );
       
       // 监听接收到的文件传输（作为接收方）
@@ -131,33 +133,6 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           setState(() {});
         }
       },
-    );
-  }
-
-  /// 显示被动连接成功 Toast
-  void _showIncomingConnectionDialog(ConnectionSuccessEvent event) {
-    if (!mounted) return;
-    
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.bluetooth_connected, color: Colors.white, size: 20),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                '${event.deviceName} 已连接',
-                style: const TextStyle(fontSize: 14),
-              ),
-            ),
-          ],
-        ),
-        backgroundColor: NearLinkColors.success,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 2),
-        margin: const EdgeInsets.all(16),
-      ),
     );
   }
 
@@ -799,62 +774,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       BuildContext context, NearbyDevice device) async {
     final provider = context.read<NearLinkProvider>();
 
-    // 显示连接中的 Toast
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-            ),
-            const SizedBox(width: 12),
-            Text('正在连接 ${device.name.isNotEmpty ? device.name : "设备"}...'),
-          ],
-        ),
-        backgroundColor: NearLinkColors.primary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        duration: const Duration(seconds: 5),
-      ),
-    );
-
-    final success = await provider.connectToDevice(device);
-
-    if (success) {
-      // 显示连接成功 Toast（无按钮）
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.check_circle, color: Colors.white, size: 20),
-              const SizedBox(width: 12),
-              Text('已与 ${device.name.isNotEmpty ? device.name : '设备'} 建立连接'),
-            ],
-          ),
-          backgroundColor: NearLinkColors.success,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          duration: const Duration(seconds: 2),
-        ),
-      );
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.error_outline, color: Colors.white, size: 20),
-              const SizedBox(width: 12),
-              Expanded(child: Text('连接失败: ${provider.errorMessage ?? "未知错误"}')),
-            ],
-          ),
-          backgroundColor: NearLinkColors.error,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        ),
-      );
-    }
+    // 静默连接，不显示任何提示
+    await provider.connectToDevice(device);
   }
 
   Future<void> _selectAndSendFile(BuildContext context) async {
@@ -909,14 +830,14 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       if (!mounted || !provider.hasSelectedFile) return;
 
       // 获取文件名用于判断
-      final fileName = fileFromPicker 
-          ? selectedFile!.name 
+      final fileName = fileFromPicker
+          ? selectedFile!.name
           : (provider.selectedFileName ?? 'photo.jpg');
-      final fileSize = fileFromPicker 
-          ? selectedFile!.size 
+      final fileSize = fileFromPicker
+          ? selectedFile!.size
           : (provider.selectedFileBytes?.length ?? 0);
       final isImage = _isImageFile(fileName);
-      
+
       // iOS 大文件提示
       if (provider.isIOS && fileSize > 50 * 1024 * 1024) {
         final advice = provider.getIosTransferAdvice(fileSize);
@@ -939,7 +860,6 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               ElevatedButton.icon(
                 onPressed: () {
                   Navigator.pop(context);
-                  // TODO: 调用 AirDrop
                 },
                 icon: const Icon(Icons.ios_share),
                 label: const Text('使用 AirDrop'),
@@ -949,8 +869,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         );
         return;  // 等待用户选择
       }
-      
-      // 如果是图片文件，询问是否压缩（iOS 图片已经过 image_picker 处理，可能不需要再次压缩）
+
+      // 如果是图片文件，询问是否压缩
       if (isImage && fileSize > 100 * 1024) {
         final fakeFile = PlatformFile(name: fileName, size: fileSize);
         final shouldCompress = await _showImageCompressionDialog(context, fakeFile);
@@ -987,11 +907,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         lowerName.endsWith('.heic') ||
         lowerName.endsWith('.heif');
   }
-  
+
   /// 显示图片压缩选项对话框
   Future<bool> _showImageCompressionDialog(BuildContext context, PlatformFile file) async {
     final originalSize = _formatFileSizeSimple(file.size);
-    
+
     return await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -1077,7 +997,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       ),
     ) ?? false;
   }
-  
+
   String _formatFileSizeSimple(int bytes) {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';

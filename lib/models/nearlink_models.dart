@@ -52,6 +52,7 @@ class FileTransfer {
   final TransferStatus status;
   final DateTime startTime;
   final String? errorMessage;
+  final bool isOutgoing;  // true=发送, false=接收
 
   const FileTransfer({
     required this.fileId,
@@ -65,6 +66,7 @@ class FileTransfer {
     this.status = TransferStatus.idle,
     required this.startTime,
     this.errorMessage,
+    this.isOutgoing = false,
   });
 
   FileTransfer copyWith({
@@ -79,6 +81,7 @@ class FileTransfer {
     TransferStatus? status,
     DateTime? startTime,
     String? errorMessage,
+    bool? isOutgoing,
   }) {
     return FileTransfer(
       fileId: fileId ?? this.fileId,
@@ -92,6 +95,7 @@ class FileTransfer {
       status: status ?? this.status,
       startTime: startTime ?? this.startTime,
       errorMessage: errorMessage ?? this.errorMessage,
+      isOutgoing: isOutgoing ?? this.isOutgoing,
     );
   }
 }
@@ -109,7 +113,7 @@ class NearLinkPacket {
   final Map<String, dynamic>? metadata;
 
   static const int headerSize = 64;
-  static const int maxPayloadSize = 512; // BLE 限制
+  static const int maxPayloadSize = 512; // BLE MTU 限制
 
   NearLinkPacket({
     required this.type,
@@ -265,8 +269,10 @@ class NearLinkPacket {
     required String deviceName,
     required String deviceId,
   }) {
+    // 限制设备名称为 32 字符，避免超过 BLE MTU 限制
+    final truncatedDeviceName = deviceName.length > 32 ? deviceName.substring(0, 32) : deviceName;
     final metadata = {
-      'deviceName': deviceName,
+      'deviceName': truncatedDeviceName,
       'deviceId': deviceId,
       'version': '1.0.0',
     };
@@ -290,8 +296,10 @@ class NearLinkPacket {
     required String deviceName,
     required String deviceId,
   }) {
+    // 限制设备名称为 32 字符，避免超过 BLE MTU 限制
+    final truncatedDeviceName = deviceName.length > 32 ? deviceName.substring(0, 32) : deviceName;
     final metadata = {
-      'deviceName': deviceName,
+      'deviceName': truncatedDeviceName,
       'deviceId': deviceId,
       'version': '1.0.0',
     };
@@ -319,10 +327,15 @@ class NearLinkPacket {
     required int totalChunks,
     required Uint8List fileChecksum,
   }) {
+    // 限制文件名为 64 字符，避免 metadata 过大导致超过 BLE MTU 限制
+    final truncatedFileName = fileName.length > 64 ? fileName.substring(0, 64) : fileName;
+    // 限制 mimeType 为 32 字符
+    final truncatedMimeType = mimeType.length > 32 ? mimeType.substring(0, 32) : mimeType;
+    
     final metadata = {
-      'fileName': fileName,
+      'fileName': truncatedFileName,
       'fileSize': fileSize,
-      'mimeType': mimeType,
+      'mimeType': truncatedMimeType,
       'totalChunks': totalChunks,
       'fileChecksum': fileChecksum,
     };

@@ -16,6 +16,7 @@ class TransferScreen extends StatefulWidget {
 class _TransferScreenState extends State<TransferScreen> {
   Timer? _progressTimer;
   TransferStatus? _lastStatus;
+  bool _lastConnectionState = true;
 
   @override
   void initState() {
@@ -23,6 +24,7 @@ class _TransferScreenState extends State<TransferScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<NearLinkProvider>();
       _lastStatus = provider.currentTransfer?.status;
+      _lastConnectionState = provider.isConnected || provider.isPeripheralConnected;
       _startProgressMonitoring();
       
       // 如果没有正在进行的传输任务，自动开始发送选中的文件
@@ -66,7 +68,7 @@ class _TransferScreenState extends State<TransferScreen> {
     super.dispose();
   }
 
-  /// 监听传输状态变化（只用于触发弹窗等特殊状态）
+  /// 监听传输状态变化和连接状态
   void _startProgressMonitoring() {
     _progressTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       if (!mounted) {
@@ -75,6 +77,17 @@ class _TransferScreenState extends State<TransferScreen> {
       }
       
       final provider = context.read<NearLinkProvider>();
+      
+      // 检测连接断开
+      final isConnected = provider.isConnected || provider.isPeripheralConnected;
+      if (_lastConnectionState && !isConnected) {
+        // 连接刚刚断开
+        _lastConnectionState = false;
+        _onConnectionLost();
+        return;
+      }
+      _lastConnectionState = isConnected;
+      
       if (provider.currentTransfer != null) {
         final transfer = provider.currentTransfer!;
         
@@ -91,6 +104,35 @@ class _TransferScreenState extends State<TransferScreen> {
         }
         
         _lastStatus = transfer.status;
+      }
+    });
+  }
+  
+  /// 连接断开时的处理
+  void _onConnectionLost() {
+    if (!mounted) return;
+    
+    // 显示断开提示
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('连接已断开，正在返回...'),
+        backgroundColor: NearLinkColors.error,
+        duration: Duration(seconds: 2),
+      ),
+    );
+    
+    // 取消所有活跃传输
+    final provider = context.read<NearLinkProvider>();
+    for (final transfer in provider.activeTransfers) {
+      if (transfer.status == TransferStatus.transferring) {
+        provider.cancelTransfer(transfer.fileId);
+      }
+    }
+    
+    // 延迟返回首页
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) {
+        Navigator.of(context).popUntil((route) => route.isFirst);
       }
     });
   }

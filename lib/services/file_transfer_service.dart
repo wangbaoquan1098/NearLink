@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
 import 'package:mime/mime.dart';
 import '../bluetooth/nearlink_bluetooth_service.dart';
@@ -21,9 +22,11 @@ class FileTransferService extends ChangeNotifier {
   final Map<String, FileTransfer> _activeTransfers = {};
   final List<FileTransfer> _transferHistory = [];
   final Map<String, List<int>> _receivedData = {};
+  final Map<String, Set<int>> _receivedChunks = {};  // 追踪每个文件已收到的 chunk 索引
 
   StreamSubscription<NearLinkPacket>? _packetSubscription;
   Completer<bool>? _transferCompleter;
+  Completer<bool>? _transferCompleteCompleter;
 
   // 握手事件流
   final StreamController<String> _handshakeController =
@@ -89,6 +92,7 @@ class FileTransferService extends ChangeNotifier {
         totalChunks: totalChunks,
         status: TransferStatus.idle,
         startTime: DateTime.now(),
+        isOutgoing: true,  // 标记为发送传输
       );
 
       // 保存文件数据供后续发送
@@ -133,6 +137,7 @@ class FileTransferService extends ChangeNotifier {
         totalChunks: totalChunks,
         status: TransferStatus.idle,
         startTime: DateTime.now(),
+        isOutgoing: true,  // 标记为发送传输
       );
 
       // 保存文件数据供后续发送
@@ -244,12 +249,38 @@ class FileTransferService extends ChangeNotifier {
       );
     }
 
-    // 发送完成包
-    final completePacket = NearLinkPacket.transferComplete(
-      fileId: fileId,
-      fileChecksum: _calculateChecksum(data),
-    );
-    await _bluetoothService.sendPacket(completePacket);
+    // 等待一小段时间确保最后一个 chunk 被对方接收
+    // BLE 传输可能需要一些时间才能完全到达对方
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    // 创建完成确认等待器
+    _transferCompleteCompleter = Completer<bool>();
+
+    // 发送完成包（带重试机制）
+    const maxRetries = 3;
+    bool ackReceived = false;
+
+    for (int retry = 0; retry < maxRetries && !ackReceived; retry++) {
+      // 发送完成包
+      final completePacket = NearLinkPacket.transferComplete(
+        fileId: fileId,
+        fileChecksum: _calculateChecksum(data),
+      );
+      await _bluetoothService.sendPacket(completePacket);
+
+      // 等待确认，最多等待 2 秒
+      ackReceived = await _transferCompleteCompleter!.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => false,
+      );
+
+      if (!ackReceived && retry < maxRetries - 1) {
+        // 没收到确认，等待后重试
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
+    }
+
+    _transferCompleteCompleter = null;
 
     _updateTransfer(fileId, status: TransferStatus.completed);
     _cleanup(fileId);
@@ -310,7 +341,10 @@ class FileTransferService extends ChangeNotifier {
 
   /// 处理传输完成确认
   void _handleTransferCompleteAck(NearLinkPacket packet) {
-    // 传输已完成
+    // 完成确认到达，通知发送方
+    if (_transferCompleteCompleter != null && !_transferCompleteCompleter!.isCompleted) {
+      _transferCompleteCompleter!.complete(true);
+    }
   }
 
   /// 处理握手
@@ -359,6 +393,7 @@ class FileTransferService extends ChangeNotifier {
 
     _activeTransfers[packet.fileId] = transfer;
     _receivedData[packet.fileId] = [];
+    _receivedChunks[packet.fileId] = {};  // 初始化 chunk 追踪集合
 
     // 发送确认
     await _bluetoothService.sendPacket(NearLinkPacket(
@@ -383,12 +418,12 @@ class FileTransferService extends ChangeNotifier {
       return;
     }
 
-    data.addAll(packet.payload);
-
-    // 计算进度百分比
-    final progressPercent = packet.totalChunks > 0 
-        ? (packet.chunkIndex + 1) * 100 ~/ packet.totalChunks 
-        : 0;
+    // 追踪已收到的 chunk
+    final receivedSet = _receivedChunks[packet.fileId];
+    if (receivedSet != null && !receivedSet.contains(packet.chunkIndex)) {
+      receivedSet.add(packet.chunkIndex);
+      data.addAll(packet.payload);
+    }
 
     // 每次都更新内部数据
     _updateTransfer(
@@ -404,6 +439,51 @@ class FileTransferService extends ChangeNotifier {
     )).catchError((e) {
       return false;
     });
+
+    // 检查是否收到了所有 chunk，如果是则自动完成传输
+    _tryAutoCompleteTransfer(packet.fileId, packet.totalChunks);
+  }
+
+  /// 检查是否收到所有 chunk
+  bool _checkAllChunksReceived(String fileId, int totalChunks) {
+    final receivedSet = _receivedChunks[fileId];
+    if (receivedSet == null) return false;
+    
+    // 检查是否收到了所有 chunk
+    return receivedSet.length >= totalChunks;
+  }
+
+  /// 尝试自动完成传输（当收到所有 chunk 但没收到 transferComplete 时）
+  Future<void> _tryAutoCompleteTransfer(String fileId, int totalChunks) async {
+    if (!_checkAllChunksReceived(fileId, totalChunks)) return;
+    
+    final data = _receivedData[fileId];
+    if (data == null) return;
+    
+    // 检查是否已经完成
+    final transfer = _activeTransfers[fileId];
+    if (transfer == null || transfer.status == TransferStatus.completed) return;
+    
+    debugPrint('[NearLink] 已收到所有 $totalChunks 个 chunk，自动完成传输');
+    
+    // 保存文件
+    await _saveFile(fileId, Uint8List.fromList(data));
+    
+    _updateTransfer(fileId, status: TransferStatus.completed);
+    
+    // 发送完成确认
+    await _bluetoothService.sendPacket(NearLinkPacket(
+      type: PacketType.transferCompleteAck,
+      fileId: fileId,
+      chunkIndex: 0,
+      totalChunks: 0,
+      payloadSize: 0,
+      checksum: '',
+      payload: Uint8List(0),
+      timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    ));
+    
+    _cleanup(fileId);
   }
 
   /// 处理块确认
@@ -459,24 +539,41 @@ class FileTransferService extends ChangeNotifier {
     _cleanup(packet.fileId);
   }
 
-  /// 保存接收到的文件到公共媒体目录
+  /// 保存接收到的文件
+  /// Android: /storage/emulated/0/NearLink/
+  /// iOS: 应用 Documents/NearLink/ (可通过 Finder 访问)
   Future<String?> _saveFile(String fileId, Uint8List data) async {
     final transfer = _activeTransfers[fileId];
     if (transfer == null) return null;
 
-    String savePath;
-    String directoryPath;
-
-    // 统一保存到设备根目录下的 NearLink 文件夹
-    directoryPath = '/storage/emulated/0/NearLink';
-    savePath = '$directoryPath/${transfer.fileName}';
-
     try {
+      // 检查并请求存储权限
+      await _requestStoragePermission();
+
+      // 根据平台选择保存路径
+      String directoryPath;
+      if (Platform.isAndroid) {
+        // Android: 保存到根目录的 NearLink 文件夹
+        // 路径: /storage/emulated/0/NearLink/
+        directoryPath = '/storage/emulated/0/NearLink';
+      } else {
+        // iOS: 保存到共享的 Documents 目录
+        final appDir = await getApplicationDocumentsDirectory();
+        directoryPath = '${appDir.path}/NearLink';
+      }
+      
+      // 生成 UUID 文件名，保留原始扩展名
+      final extension = _getFileExtension(transfer.fileName);
+      final uuidFileName = '$fileId$extension';
+      final savePath = '$directoryPath/$uuidFileName';
+
+      // 创建目录
       final saveDir = Directory(directoryPath);
       if (!await saveDir.exists()) {
         await saveDir.create(recursive: true);
       }
 
+      // 写入文件
       final file = File(savePath);
       await file.writeAsBytes(data);
       _fileSavedController.add(savePath);
@@ -484,9 +581,11 @@ class FileTransferService extends ChangeNotifier {
     } catch (e) {
       // 保存失败时尝试备用方案：应用私有目录
       try {
-        final directory = await getApplicationDocumentsDirectory();
-        final backupPath = '${directory.path}/NearLink/${transfer.fileName}';
-        final backupDir = Directory('${directory.path}/NearLink');
+        final appDir = await getApplicationDocumentsDirectory();
+        final extension = _getFileExtension(transfer.fileName);
+        final uuidFileName = '$fileId$extension';
+        final backupPath = '${appDir.path}/NearLink/$uuidFileName';
+        final backupDir = Directory('${appDir.path}/NearLink');
         if (!await backupDir.exists()) {
           await backupDir.create(recursive: true);
         }
@@ -497,6 +596,35 @@ class FileTransferService extends ChangeNotifier {
       } catch (_) {
         return null;
       }
+    }
+  }
+  
+  /// 获取文件扩展名
+  String _getFileExtension(String fileName) {
+    final lastDot = fileName.lastIndexOf('.');
+    if (lastDot > 0 && lastDot < fileName.length - 1) {
+      return fileName.substring(lastDot);
+    }
+    return '';
+  }
+
+  /// 请求存储权限
+  Future<void> _requestStoragePermission() async {
+    // 检查是否已有存储权限
+    if (await Permission.storage.isGranted) {
+      return;
+    }
+
+    // Android 11+ 需要 MANAGE_EXTERNAL_STORAGE 权限才能写入外部存储根目录
+    if (await Permission.manageExternalStorage.isGranted) {
+      return;
+    }
+
+    // 请求 MANAGE_EXTERNAL_STORAGE 权限
+    final status = await Permission.manageExternalStorage.request();
+    if (!status.isGranted) {
+      // 如果用户拒绝，尝试请求基本存储权限
+      await Permission.storage.request();
     }
   }
 
@@ -517,12 +645,19 @@ class FileTransferService extends ChangeNotifier {
   void _cleanup(String fileId) {
     final completedTransfer = _activeTransfers[fileId];
     _receivedData.remove(fileId);
-    _activeTransfers.remove(fileId);
+    _receivedChunks.remove(fileId);  // 清理 chunk 追踪
+    
     if (completedTransfer != null) {
       _transferHistory.insert(0, completedTransfer);
     }
-    // 使用立即刷新确保 UI 立即更新
-    _notifyListenersImmediate();
+    
+    // 延迟移除传输对象，给 UI 时间检测 completed 状态并自动返回
+    // 这样 Selector 能在 currentTransfer 仍存在时检测到 completed 状态
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      _activeTransfers.remove(fileId);
+      // 使用立即刷新确保 UI 立即更新
+      _notifyListenersImmediate();
+    });
   }
 
   void _updateTransfer(
