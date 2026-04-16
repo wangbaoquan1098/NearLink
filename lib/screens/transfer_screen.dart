@@ -19,6 +19,13 @@ class _TransferScreenState extends State<TransferScreen> {
   Timer? _progressTimer;
   TransferStatus? _lastStatus;
   bool _lastConnectionState = true;
+  ScaffoldMessengerState? _scaffoldMessenger;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _scaffoldMessenger = ScaffoldMessenger.maybeOf(context);
+  }
 
   @override
   void initState() {
@@ -41,11 +48,11 @@ class _TransferScreenState extends State<TransferScreen> {
   void _startSending() async {
     try {
       final provider = context.read<NearLinkProvider>();
-      final scaffoldMessenger = ScaffoldMessenger.of(context);
+      final scaffoldMessenger = _scaffoldMessenger;
 
       final transfer = await provider.sendFile();
 
-      if (transfer == null && mounted) {
+      if (transfer == null && mounted && scaffoldMessenger != null) {
         scaffoldMessenger.showSnackBar(
           const SnackBar(
             content: Text('发送失败：无法准备文件或未连接'),
@@ -54,8 +61,8 @@ class _TransferScreenState extends State<TransferScreen> {
         );
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+      if (mounted && _scaffoldMessenger != null) {
+        _scaffoldMessenger!.showSnackBar(
           SnackBar(
             content: Text('发送异常: $e'),
             backgroundColor: NearLinkColors.error,
@@ -68,6 +75,7 @@ class _TransferScreenState extends State<TransferScreen> {
   @override
   void dispose() {
     _progressTimer?.cancel();
+    _scaffoldMessenger?.hideCurrentSnackBar();
     super.dispose();
   }
 
@@ -117,7 +125,7 @@ class _TransferScreenState extends State<TransferScreen> {
     if (!mounted) return;
 
     // 显示断开提示
-    ScaffoldMessenger.of(context).showSnackBar(
+    _scaffoldMessenger?.showSnackBar(
       const SnackBar(
         content: Text('连接已断开，正在返回...'),
         backgroundColor: NearLinkColors.error,
@@ -144,7 +152,8 @@ class _TransferScreenState extends State<TransferScreen> {
   void _onTransferComplete(FileTransfer transfer) async {
     if (!mounted) return;
 
-    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    final scaffoldMessenger = _scaffoldMessenger;
+    if (scaffoldMessenger == null) return;
     scaffoldMessenger.hideCurrentSnackBar();
 
     // 显示成功提示
@@ -167,24 +176,41 @@ class _TransferScreenState extends State<TransferScreen> {
     Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
-  void _onTransferFailed(FileTransfer transfer) {
+  void _onTransferFailed(FileTransfer transfer) async {
     if (!mounted) return;
 
-    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    final scaffoldMessenger = _scaffoldMessenger;
+    if (scaffoldMessenger == null) return;
     scaffoldMessenger.hideCurrentSnackBar();
+    final errorMessage = transfer.errorMessage ?? "未知错误";
+    final isInterruptedIncomingTransfer =
+        !transfer.isOutgoing && errorMessage == '接收已中断';
+
     scaffoldMessenger.showSnackBar(
       SnackBar(
-        content: Text('传输失败: ${transfer.errorMessage ?? "未知错误"}'),
+        content: Text('传输失败: $errorMessage'),
         backgroundColor: NearLinkColors.error,
-        action: SnackBarAction(
-          label: '重试',
-          textColor: Colors.white,
-          onPressed: () {
-            // 重试逻辑
-          },
-        ),
+        duration: isInterruptedIncomingTransfer
+            ? const Duration(seconds: 2)
+            : const Duration(days: 1),
+        action: isInterruptedIncomingTransfer
+            ? null
+            : SnackBarAction(
+                label: '重试',
+                textColor: Colors.white,
+                onPressed: () {
+                  // 重试逻辑
+                },
+              ),
       ),
     );
+
+    if (isInterruptedIncomingTransfer) {
+      await Future.delayed(const Duration(milliseconds: 900));
+      if (!mounted) return;
+      scaffoldMessenger.hideCurrentSnackBar();
+      Navigator.of(context).pop();
+    }
   }
 
   @override

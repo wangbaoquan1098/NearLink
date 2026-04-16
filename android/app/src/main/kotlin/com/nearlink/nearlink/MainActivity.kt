@@ -148,6 +148,22 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(pendingCount)
                 }
+                "clearPendingNotifications" -> {
+                    val cleared = if (connectedDevice != null) {
+                        gattServer?.clearPendingNotifications(connectedDevice!!) ?: false
+                    } else {
+                        true
+                    }
+                    result.success(cleared)
+                }
+                "clearTransferBuffers" -> {
+                    val cleared = if (connectedDevice != null) {
+                        gattServer?.clearPendingNotifications(connectedDevice!!) ?: false
+                    } else {
+                        true
+                    }
+                    result.success(cleared)
+                }
                 "getConnectedCentralsCount" -> {
                     result.success(if (connectedDevice != null) 1 else 0)
                 }

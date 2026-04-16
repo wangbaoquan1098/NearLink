@@ -39,6 +39,27 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     // NearLink 包头部大小
     private let nearlinkHeaderSize = 64
+
+    private func shortFileId(from packet: Data) -> String {
+        guard packet.count >= 33 else { return "" }
+        let fileIdBytes = packet.subdata(in: 1..<33)
+        let filtered = fileIdBytes.filter { $0 != 0 }
+        let fileId = String(data: Data(filtered), encoding: .utf8) ?? ""
+        return String(fileId.prefix(8))
+    }
+
+    private func packetTypeName(_ type: UInt8) -> String {
+        switch type {
+        case 2: return "fileInfo"
+        case 3: return "fileInfoAck"
+        case 8: return "transferComplete"
+        case 9: return "transferCompleteAck"
+        case 10: return "cancel"
+        case 11: return "ping"
+        case 12: return "pong"
+        default: return "type\(type)"
+        }
+    }
     
     static let shared = BleAdvertiser()
     
@@ -250,6 +271,17 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
 
         // 将数据加入重组缓冲区
         reassemblyBuffer.append(combinedData)
+        if reassemblyBuffer.count >= nearlinkHeaderSize {
+            let type = reassemblyBuffer[0]
+            if type == 2 || type == 3 || type == 8 || type == 9 || type == 10 {
+                NSLog(
+                    "[BleAdvertiser][trace] didReceiveWrite append type=%@ file=%@ buffer=%d",
+                    packetTypeName(type),
+                    shortFileId(from: reassemblyBuffer),
+                    reassemblyBuffer.count
+                )
+            }
+        }
 
         // 处理重组缓冲区的数据
         processReassemblyBuffer()
@@ -316,6 +348,15 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             // 提取完整包
             let packet = reassemblyBuffer.subdata(in: 0..<totalPacketLength)
             reassemblyBuffer = reassemblyBuffer.subdata(in: totalPacketLength..<reassemblyBuffer.count)
+            let type = packet[0]
+            if type == 2 || type == 3 || type == 8 || type == 9 || type == 10 {
+                NSLog(
+                    "[BleAdvertiser][trace] packet complete type=%@ file=%@ remaining=%d",
+                    packetTypeName(type),
+                    shortFileId(from: packet),
+                    reassemblyBuffer.count
+                )
+            }
             
             // 转发给 Flutter
             let eventData: [String: Any] = [
@@ -563,6 +604,22 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     func getPendingNotificationCount() -> Int {
         return pendingDataQueue.count
     }
+
+    func clearPendingNotifications() -> Bool {
+        pendingDataQueue.removeAll()
+        return true
+    }
+
+    func clearTransferBuffers() -> Bool {
+        NSLog(
+            "[BleAdvertiser][trace] clearTransferBuffers queue=%d reassembly=%d",
+            pendingDataQueue.count,
+            reassemblyBuffer.count
+        )
+        pendingDataQueue.removeAll()
+        reassemblyBuffer = Data()
+        return true
+    }
     
     // MARK: - 连接状态监听
     
@@ -681,6 +738,12 @@ extension BleAdvertiser: FlutterStreamHandler {
 
             case "getPendingNotificationCount":
                 result(self.getPendingNotificationCount())
+
+            case "clearPendingNotifications":
+                result(self.clearPendingNotifications())
+
+            case "clearTransferBuffers":
+                result(self.clearTransferBuffers())
                 
             default:
                 result(FlutterMethodNotImplemented)

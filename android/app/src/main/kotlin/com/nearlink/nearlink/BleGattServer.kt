@@ -295,6 +295,16 @@ class BleGattServer(private val context: Context) {
         return queue?.size ?: 0
     }
 
+    fun clearPendingNotifications(device: BluetoothDevice): Boolean {
+        return try {
+            clearNotificationState(device)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "清空待发送通知队列失败: ${e.message}")
+            false
+        }
+    }
+
     private fun enqueueNotificationFragments(
         queue: ArrayDeque<ByteArray>,
         data: ByteArray,

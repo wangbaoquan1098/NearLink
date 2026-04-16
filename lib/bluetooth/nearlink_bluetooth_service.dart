@@ -78,6 +78,8 @@ class NearLinkBluetoothService extends ChangeNotifier {
   // Android 广播通道
   static const MethodChannel _androidChannel =
       MethodChannel('com.nearlink/ble_advertise');
+  static const MethodChannel _flutterBluePlusChannel =
+      MethodChannel('flutter_blue_plus/methods');
 
   // iOS Event Channel（监听作为 Peripheral 时的连接事件）
   static const EventChannel _iosEventChannel =
@@ -99,7 +101,12 @@ class NearLinkBluetoothService extends ChangeNotifier {
   final List<int> _packetBuffer = [];
   Timer? _heartbeatTimer;
   DateTime? _lastPeerActivityAt;
+  DateTime? _peerTimeoutSuspendedUntil;
   bool _heartbeatInFlight = false;
+  int _consecutiveHeartbeatFailures = 0;
+  int _centralWriteGeneration = 0;
+  Future<void> _androidCentralWriteQueue = Future.value();
+  Future<void> _iosCentralWriteQueue = Future.value();
 
   // Getters
 
@@ -189,6 +196,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
               break;
 
             case 'centralDisconnected':
+              debugPrint(
+                '[NearLink][trace] event centralDisconnected '
+                'central=${event['centralId']}',
+              );
               // 中心设备断开
               _isPeripheralConnected = false;
               _connectedCentralId = null;
@@ -906,6 +917,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
   void handleRemoteDisconnectSignal() {
     final wasPeripheralConnected = _isPeripheralConnected;
+    debugPrint(
+      '[NearLink][trace] handleRemoteDisconnectSignal '
+      'wasPeripheral=$wasPeripheralConnected device=${_connectedDevice?.remoteId.str}',
+    );
 
     _rxSubscription?.cancel();
     _rxSubscription = null;
@@ -925,9 +940,48 @@ class NearLinkBluetoothService extends ChangeNotifier {
     if (device != null) {
       unawaited(device.disconnect().catchError((_) {}));
     }
-    if (wasPeripheralConnected && Platform.isAndroid) {
+    if (wasPeripheralConnected) {
       unawaited(_androidChannel.invokeMethod('disconnect').catchError((error) {
-        debugPrint('[NearLink] Android 原生断开远端连接失败: $error');
+        debugPrint('[NearLink] 原生断开远端连接失败: $error');
+        return false;
+      }));
+    }
+
+    _updateConnectionState(NearLinkConnectionState.disconnected);
+    notifyListeners();
+  }
+
+  void handleLinkFailure([String message = '连接已失效']) {
+    final wasPeripheralConnected = _isPeripheralConnected;
+    debugPrint(
+      '[NearLink][trace] handleLinkFailure '
+      'message=$message wasPeripheral=$wasPeripheralConnected '
+      'device=${_connectedDevice?.remoteId.str}',
+    );
+
+    _connectionStateSubscription?.cancel();
+    _connectionStateSubscription = null;
+    _rxSubscription?.cancel();
+    _rxSubscription = null;
+    _txCharacteristic = null;
+    _rxCharacteristic = null;
+    _packetBuffer.clear();
+    _isPeripheralConnected = false;
+    _connectedCentralId = null;
+    _connectedCentralName = null;
+    _connectedCentralMtu = null;
+    _connectedDeviceIsIOSPeer = false;
+    _errorMessage = message;
+    _stopHeartbeatMonitoring();
+
+    final device = _connectedDevice;
+    _connectedDevice = null;
+    if (device != null) {
+      unawaited(device.disconnect().catchError((_) {}));
+    }
+    if (wasPeripheralConnected) {
+      unawaited(_androidChannel.invokeMethod('disconnect').catchError((error) {
+        debugPrint('[NearLink] 原生清理失效连接失败: $error');
         return false;
       }));
     }
@@ -939,6 +993,20 @@ class NearLinkBluetoothService extends ChangeNotifier {
   void _markPeerActive() {
     _lastPeerActivityAt = DateTime.now();
     _heartbeatInFlight = false;
+    _consecutiveHeartbeatFailures = 0;
+  }
+
+  void deferPeerTimeout([Duration duration = const Duration(seconds: 12)]) {
+    final until = DateTime.now().add(duration);
+    if (_peerTimeoutSuspendedUntil == null ||
+        until.isAfter(_peerTimeoutSuspendedUntil!)) {
+      _peerTimeoutSuspendedUntil = until;
+    }
+    _markPeerActive();
+  }
+
+  void abortActiveCentralWrites() {
+    _centralWriteGeneration += 1;
   }
 
   void _startHeartbeatMonitoring() {
@@ -954,7 +1022,9 @@ class NearLinkBluetoothService extends ChangeNotifier {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
     _lastPeerActivityAt = null;
+    _peerTimeoutSuspendedUntil = null;
     _heartbeatInFlight = false;
+    _consecutiveHeartbeatFailures = 0;
   }
 
   Future<void> _heartbeatTick() async {
@@ -963,13 +1033,15 @@ class NearLinkBluetoothService extends ChangeNotifier {
       return;
     }
 
-    final lastActivity = _lastPeerActivityAt ?? DateTime.now();
-    final idleFor = DateTime.now().difference(lastActivity);
-
-    if (idleFor.inSeconds >= NearLinkConstants.peerTimeout) {
-      handleRemoteDisconnectSignal();
+    final timeoutSuspendedUntil = _peerTimeoutSuspendedUntil;
+    if (timeoutSuspendedUntil != null &&
+        DateTime.now().isBefore(timeoutSuspendedUntil)) {
       return;
     }
+    _peerTimeoutSuspendedUntil = null;
+
+    final lastActivity = _lastPeerActivityAt ?? DateTime.now();
+    final idleFor = DateTime.now().difference(lastActivity);
 
     if (_heartbeatInFlight) {
       return;
@@ -983,7 +1055,13 @@ class NearLinkBluetoothService extends ChangeNotifier {
     final success = await sendPacket(NearLinkPacket.ping());
     if (!success) {
       _heartbeatInFlight = false;
-      debugPrint('[NearLink] 心跳发送失败，等待超时判定');
+      _consecutiveHeartbeatFailures += 1;
+      debugPrint(
+        '[NearLink] 心跳发送失败($_consecutiveHeartbeatFailures/3)，等待系统连接状态更新',
+      );
+      if (_consecutiveHeartbeatFailures >= 3) {
+        handleLinkFailure('连接已失效');
+      }
     }
   }
 
@@ -1016,16 +1094,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
       return false;
     }
 
-    // 检查连接状态
-    try {
-      final state = await _connectedDevice!.connectionState.first;
-      if (state != BluetoothConnectionState.connected) {
-        _errorMessage = '蓝牙连接已断开';
-        notifyListeners();
-        return false;
-      }
-    } catch (e) {
-      _errorMessage = '连接状态检查失败';
+    // 热路径上直接复用已有连接状态缓存，避免每次发送都等待一次异步流。
+    if (_connectionState != NearLinkConnectionState.connected) {
+      _errorMessage = '蓝牙连接已断开';
+      notifyListeners();
       return false;
     }
 
@@ -1034,12 +1106,74 @@ class NearLinkBluetoothService extends ChangeNotifier {
       // iOS BLE MTU 最大为 185，减去 3 字节 ATT 头，实际可用约 182
       // 为了安全，使用 180 字节
       final bool isTargetIOS = _connectedDeviceIsIOSPeer;
+      final bool isIOSCentralToAndroid = Platform.isIOS && !isTargetIOS;
 
+      if (isIOSCentralToAndroid) {
+        return _sendDataFromIOSCentralToAndroid(data);
+      }
+
+      if (Platform.isAndroid) {
+        return _sendDataFromAndroidCentral(data, isTargetIOS);
+      }
+
+      final int writeGeneration = _centralWriteGeneration;
+      return _performCentralWrite(
+        data,
+        isTargetIOS: isTargetIOS,
+        writeGeneration: writeGeneration,
+      );
+    } catch (e) {
+      _errorMessage = '发送失败: $e';
+      return false;
+    }
+  }
+
+  Future<bool> _sendDataFromAndroidCentral(
+    Uint8List data,
+    bool isTargetIOS,
+  ) async {
+    final completer = Completer<bool>();
+    final generation = _centralWriteGeneration;
+
+    _androidCentralWriteQueue =
+        _androidCentralWriteQueue.catchError((_) {}).then((_) async {
+      if (generation != _centralWriteGeneration) {
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        return;
+      }
+
+      try {
+        final result = await _performCentralWrite(
+          data,
+          isTargetIOS: isTargetIOS,
+          writeGeneration: generation,
+        );
+        if (!completer.isCompleted) {
+          completer.complete(result);
+        }
+      } catch (e, stackTrace) {
+        if (!completer.isCompleted) {
+          completer.completeError(e, stackTrace);
+        }
+      }
+    });
+
+    return completer.future;
+  }
+
+  Future<bool> _performCentralWrite(
+    Uint8List data, {
+    required bool isTargetIOS,
+    required int writeGeneration,
+  }) async {
+    try {
       // 检查特征值是否支持不带响应写入
       final bool canWriteWithoutResponse =
           _rxCharacteristic!.properties.writeWithoutResponse;
       final int writeWindowSize =
-          canWriteWithoutResponse ? (isTargetIOS ? 4 : 8) : 1;
+          canWriteWithoutResponse ? (isTargetIOS ? 1 : 8) : 1;
       final pendingWrites = <Future<void>>[];
 
       final int chunkSize = isTargetIOS ? 180 : 512;
@@ -1047,6 +1181,11 @@ class NearLinkBluetoothService extends ChangeNotifier {
       // debugPrint('[NearLink] sendData: chunkSize=$chunkSize, targetIOS=$isTargetIOS');
       int offset = 0;
       while (offset < data.length) {
+        if (writeGeneration != _centralWriteGeneration) {
+          _errorMessage = '发送已取消';
+          return false;
+        }
+
         final end = (offset + chunkSize < data.length)
             ? offset + chunkSize
             : data.length;
@@ -1064,6 +1203,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
           if (shouldFlushWindow) {
             await Future.wait(pendingWrites, eagerError: true);
             pendingWrites.clear();
+            if (writeGeneration != _centralWriteGeneration) {
+              _errorMessage = '发送已取消';
+              return false;
+            }
           }
         } catch (writeError) {
           // GATT_INVALID_HANDLE 通常表示连接已断开
@@ -1090,12 +1233,122 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
       if (pendingWrites.isNotEmpty) {
         await Future.wait(pendingWrites, eagerError: true);
+        if (writeGeneration != _centralWriteGeneration) {
+          _errorMessage = '发送已取消';
+          return false;
+        }
       }
       return true;
     } catch (e) {
       _errorMessage = '发送失败: $e';
       return false;
     }
+  }
+
+  Future<bool> _sendDataFromIOSCentralToAndroid(Uint8List data) async {
+    final completer = Completer<bool>();
+
+    _iosCentralWriteQueue =
+        _iosCentralWriteQueue.catchError((_) {}).then((_) async {
+      try {
+        final result = await _performIOSCentralWrite(data);
+        if (!completer.isCompleted) {
+          completer.complete(result);
+        }
+      } catch (e, stackTrace) {
+        if (!completer.isCompleted) {
+          completer.completeError(e, stackTrace);
+        }
+      }
+    });
+
+    return completer.future;
+  }
+
+  Future<bool> _performIOSCentralWrite(Uint8List data) async {
+    final characteristic = _rxCharacteristic;
+    final device = _connectedDevice;
+    if (characteristic == null || device == null) {
+      _errorMessage = '未连接到 Android 设备';
+      return false;
+    }
+
+    final mtuNow = device.mtuNow;
+    final chunkSize = (mtuNow - 3).clamp(20, 512);
+    final writeReadyStream = FlutterBluePlus.events.onCharacteristicWritten
+        .where((event) => event.device.remoteId == device.remoteId)
+        .where((event) =>
+            event.characteristic.serviceUuid == characteristic.serviceUuid)
+        .where((event) =>
+            event.characteristic.characteristicUuid ==
+            characteristic.characteristicUuid)
+        .where((event) =>
+            event.characteristic.instanceId == characteristic.instanceId)
+        .where((event) => event.error == null);
+
+    Future<bool> waitUntilReady() async {
+      try {
+        await writeReadyStream.first.timeout(const Duration(seconds: 10));
+        return true;
+      } catch (_) {
+        _errorMessage = '等待 iOS 写入队列就绪超时';
+        return false;
+      }
+    }
+
+    int offset = 0;
+
+    while (offset < data.length) {
+      var hitBackpressure = false;
+
+      while (offset < data.length) {
+        final end = (offset + chunkSize < data.length)
+            ? offset + chunkSize
+            : data.length;
+        final chunk = data.sublist(offset, end);
+
+        try {
+          await _flutterBluePlusChannel.invokeMethod<bool>(
+            'writeCharacteristic',
+            {
+              'remote_id': device.remoteId.str,
+              'primary_service_uuid': characteristic.primaryServiceUuid?.str,
+              'service_uuid': characteristic.serviceUuid.str,
+              'characteristic_uuid': characteristic.characteristicUuid.str,
+              'instance_id': characteristic.instanceId,
+              'write_type': 1,
+              'allow_long_write': 0,
+              'value': Uint8List.fromList(chunk),
+            },
+          );
+          offset = end;
+        } on PlatformException catch (e) {
+          final message = e.message ?? '';
+          if (message.contains('canSendWriteWithoutResponse is false')) {
+            hitBackpressure = true;
+            break;
+          }
+          _errorMessage = '写入失败: $message';
+          return false;
+        } catch (e) {
+          _errorMessage = '写入失败: $e';
+          return false;
+        }
+      }
+
+      if (!hitBackpressure) {
+        break;
+      }
+
+      if (offset < data.length) {
+        final ready = await waitUntilReady();
+        if (!ready) {
+          return false;
+        }
+      }
+    }
+
+    return true;
   }
 
   /// iOS 作为 Peripheral 时发送数据（通过原生层）
@@ -1165,6 +1418,36 @@ class NearLinkBluetoothService extends ChangeNotifier {
     } catch (e) {
       _errorMessage = '获取发送队列状态失败: $e';
       return -1;
+    }
+  }
+
+  Future<bool> clearPendingPeripheralNotifications() async {
+    if (!_isPeripheralConnected || (!Platform.isAndroid && !Platform.isIOS)) {
+      return true;
+    }
+
+    try {
+      final cleared =
+          await _androidChannel.invokeMethod<bool>('clearPendingNotifications');
+      return cleared ?? false;
+    } catch (e) {
+      _errorMessage = '清空发送队列失败: $e';
+      return false;
+    }
+  }
+
+  Future<bool> clearPeripheralTransferBuffers() async {
+    if (!_isPeripheralConnected || (!Platform.isAndroid && !Platform.isIOS)) {
+      return true;
+    }
+
+    try {
+      final cleared =
+          await _androidChannel.invokeMethod<bool>('clearTransferBuffers');
+      return cleared ?? false;
+    } catch (e) {
+      _errorMessage = '清空传输缓冲失败: $e';
+      return false;
     }
   }
 
@@ -1370,6 +1653,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
   /// 设置数据包接收回调
   void setPacketListener(void Function(NearLinkPacket) listener) {
     _onPacketReceived = listener;
+  }
+
+  void clearPacketBuffer() {
+    _packetBuffer.clear();
   }
 
   /// 发送握手

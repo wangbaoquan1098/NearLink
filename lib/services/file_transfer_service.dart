@@ -41,7 +41,12 @@ class FileTransferService extends ChangeNotifier {
   Completer<bool>? _transferCompleter;
   Completer<bool>? _transferCompleteCompleter;
   final Map<String, DateTime> _recentlyCompletedIncomingTransfers = {};
+  final Map<String, DateTime> _incomingTransferActivityAt = {};
   Future<void> _controlPacketSendQueue = Future.value();
+  int _controlPacketQueueGeneration = 0;
+  final Set<String> _cancelledTransferIds = {};
+  Timer? _incomingTransferWatchdog;
+  static const Duration _incomingTransferStallTimeout = Duration(seconds: 6);
 
   // 握手事件流
   final StreamController<String> _handshakeController =
@@ -64,6 +69,9 @@ class FileTransferService extends ChangeNotifier {
   List<FileTransfer> get transferHistory => List.unmodifiable(_transferHistory);
   FileTransfer? get currentTransfer =>
       _activeTransfers.isNotEmpty ? _activeTransfers.values.first : null;
+
+  String _shortFileId(String fileId) =>
+      fileId.length <= 8 ? fileId : fileId.substring(0, 8);
 
   int _batchAckIntervalFor(NearLinkPacket packet) {
     if (packet.payload.length >= NearLinkConstants.maxChunkSize) {
@@ -106,6 +114,7 @@ class FileTransferService extends ChangeNotifier {
   /// 初始化
   void initialize() {
     _bluetoothService.setPacketListener(_handlePacket);
+    _startIncomingTransferWatchdog();
   }
 
   /// 准备发送文件（可指定是否压缩图片）
@@ -212,6 +221,7 @@ class FileTransferService extends ChangeNotifier {
 
   /// 开始发送文件
   Future<bool> startSend(String fileId) async {
+    _resetControlPacketQueue();
     final transfer = _activeTransfers[fileId];
     // 检查连接状态：作为 Central 连接到外设，或作为 Peripheral 被连接
     final isConnected = _bluetoothService.isConnected ||
@@ -253,9 +263,15 @@ class FileTransferService extends ChangeNotifier {
         fileChecksum: Uint8List.fromList(fileChecksum.codeUnits),
       );
 
+      debugPrint(
+        '[FileTransfer][trace] startSend fileInfo -> ${_shortFileId(fileId)} '
+        'size=${transfer.fileSize} chunks=$actualTotalChunks '
+        'peripheral=${_bluetoothService.isPeripheralConnected}',
+      );
       _updateTransfer(fileId, status: TransferStatus.transferring);
       final sendResult = await _bluetoothService.sendPacket(fileInfoPacket);
       if (!sendResult) {
+        _bluetoothService.handleLinkFailure('发送文件信息失败');
         _updateTransfer(fileId,
             status: TransferStatus.failed, errorMessage: '发送文件信息失败');
         return false;
@@ -270,6 +286,10 @@ class FileTransferService extends ChangeNotifier {
       );
 
       if (!confirmed) {
+        debugPrint(
+          '[FileTransfer][trace] fileInfoAck timeout <- ${_shortFileId(fileId)}',
+        );
+        _bluetoothService.handleLinkFailure('对方未确认接收');
         _updateTransfer(fileId,
             status: TransferStatus.failed, errorMessage: '对方未确认接收');
         return false;
@@ -329,6 +349,10 @@ class FileTransferService extends ChangeNotifier {
     for (int batchStart = 0;
         batchStart < totalChunks;
         batchStart += batchSize) {
+      if (_isTransferCancelled(fileId)) {
+        return;
+      }
+
       final batchEnd = (batchStart + batchSize < totalChunks)
           ? batchStart + batchSize
           : totalChunks;
@@ -336,6 +360,10 @@ class FileTransferService extends ChangeNotifier {
 
       // 构建一批数据包
       for (int i = batchStart; i < batchEnd; i++) {
+        if (_isTransferCancelled(fileId)) {
+          return;
+        }
+
         final start = i * chunkSize;
         final end = (start + chunkSize).clamp(0, data.length);
         final chunk = data.sublist(start, end);
@@ -357,6 +385,10 @@ class FileTransferService extends ChangeNotifier {
         return;
       }
 
+      if (_isTransferCancelled(fileId)) {
+        return;
+      }
+
       // 移除批次间延迟，最大化传输速度
       // 让原生层自己控制发送速率
     }
@@ -374,11 +406,19 @@ class FileTransferService extends ChangeNotifier {
   ) async {
     final shouldOptimisticallyAdvanceProgress =
         !(Platform.isAndroid && _bluetoothService.isPeripheralConnected);
-    final transportBatchPacketCount = isTargetIOS ? 8 : 6;
+    // iOS 作为 Central 向 Android Peripheral 发送时，放大协议包聚合批次，
+    // 减少 Flutter -> 插件层的往返次数。
+    final transportBatchPacketCount = (Platform.isAndroid && isTargetIOS)
+        ? 1
+        : (isTargetIOS ? 8 : (Platform.isIOS ? 14 : 6));
     BytesBuilder transportBuffer = BytesBuilder(copy: false);
     int lastPacketIndexInBatch = -1;
 
     for (int i = 0; i < totalChunks; i++) {
+      if (_isTransferCancelled(fileId)) {
+        return;
+      }
+
       final start = i * chunkSize;
       final end = (start + chunkSize).clamp(0, data.length);
       final chunk = data.sublist(start, end);
@@ -404,13 +444,23 @@ class FileTransferService extends ChangeNotifier {
           transportBuffer.toBytes(),
         );
         if (!sendResult) {
+          if (_isTransferCancelled(fileId)) {
+            return;
+          }
           _updateTransfer(fileId,
               status: TransferStatus.failed, errorMessage: '发送失败');
           return;
         }
       } catch (e) {
+        if (_isTransferCancelled(fileId)) {
+          return;
+        }
         _updateTransfer(fileId,
             status: TransferStatus.failed, errorMessage: e.toString());
+        return;
+      }
+
+      if (_isTransferCancelled(fileId)) {
         return;
       }
 
@@ -436,6 +486,7 @@ class FileTransferService extends ChangeNotifier {
   Future<void> _finalizeOutgoingTransfer(String fileId, Uint8List data) async {
     final transfer = _activeTransfers[fileId];
     if (transfer == null) return;
+    if (_isTransferCancelled(fileId)) return;
 
     final isPeripheralSender = _bluetoothService.isPeripheralConnected;
 
@@ -451,6 +502,7 @@ class FileTransferService extends ChangeNotifier {
         return;
       }
     }
+    if (_isTransferCancelled(fileId)) return;
 
     // 等待一小段时间确保最后一个 chunk 被对方接收
     // BLE 传输可能需要一些时间才能完全到达对方
@@ -459,6 +511,7 @@ class FileTransferService extends ChangeNotifier {
           ? const Duration(milliseconds: 100)
           : const Duration(milliseconds: 300),
     );
+    if (_isTransferCancelled(fileId)) return;
 
     final completePacket = NearLinkPacket.transferComplete(
       fileId: fileId,
@@ -477,6 +530,7 @@ class FileTransferService extends ChangeNotifier {
     );
 
     _transferCompleteCompleter = null;
+    if (_isTransferCancelled(fileId)) return;
 
     final latestTransfer = _activeTransfers[fileId];
     if (latestTransfer == null ||
@@ -599,10 +653,18 @@ class FileTransferService extends ChangeNotifier {
       return;
     }
 
+    if (_bluetoothService.isPeripheralConnected) {
+      unawaited(_bluetoothService.clearPeripheralTransferBuffers());
+    }
+
     final fileName = packet.metadata!['fileName'] as String;
     final fileSize = packet.metadata!['fileSize'] as int;
     final mimeType = packet.metadata!['mimeType'] as String;
     final totalChunks = packet.metadata!['totalChunks'] as int;
+    debugPrint(
+      '[FileTransfer][trace] fileInfo received <- ${_shortFileId(packet.fileId)} '
+      'size=$fileSize chunks=$totalChunks',
+    );
 
     final transfer = FileTransfer(
       fileId: packet.fileId,
@@ -618,6 +680,7 @@ class FileTransferService extends ChangeNotifier {
     _activeTransfers[packet.fileId] = transfer;
     _receivedData[packet.fileId] = [];
     _receivedChunks[packet.fileId] = {}; // 初始化 chunk 追踪集合
+    _incomingTransferActivityAt[packet.fileId] = DateTime.now();
 
     // 发送确认
     await _sendControlPacketSerialized(NearLinkPacket(
@@ -641,6 +704,8 @@ class FileTransferService extends ChangeNotifier {
     if (data == null) {
       return;
     }
+
+    _incomingTransferActivityAt[packet.fileId] = DateTime.now();
 
     // 追踪已收到的 chunk
     final receivedSet = _receivedChunks[packet.fileId];
@@ -808,6 +873,7 @@ class FileTransferService extends ChangeNotifier {
     // 先更新状态为已完成，让 UI 可以响应
     _updateTransfer(packet.fileId, status: TransferStatus.completed);
     _rememberCompletedIncomingTransfer(packet.fileId);
+    _incomingTransferActivityAt.remove(packet.fileId);
     // debugPrint('[FileTransfer] _handleTransferComplete: 状态已更新为 completed');
 
     // 在后台保存文件（不阻塞 UI）
@@ -829,10 +895,33 @@ class FileTransferService extends ChangeNotifier {
   /// 处理取消
   void _handleCancel(NearLinkPacket packet) {
     if (packet.fileId.isEmpty) {
+      debugPrint('[FileTransfer][trace] disconnect signal received');
       _bluetoothService.handleRemoteDisconnectSignal();
       return;
     }
 
+    debugPrint(
+      '[FileTransfer][trace] cancel received <- ${_shortFileId(packet.fileId)}',
+    );
+    _bluetoothService.deferPeerTimeout();
+    _bluetoothService.clearPacketBuffer();
+    _bluetoothService.abortActiveCentralWrites();
+    unawaited(_bluetoothService.clearPeripheralTransferBuffers());
+    _resetControlPacketQueue();
+    _incomingTransferActivityAt.remove(packet.fileId);
+    _cancelledTransferIds.add(packet.fileId);
+    final transfer = _activeTransfers[packet.fileId];
+    if (transfer != null && transfer.isOutgoing) {
+      if (_transferCompleter != null && !_transferCompleter!.isCompleted) {
+        _transferCompleter!.complete(false);
+      }
+      if (_transferCompleteCompleter != null &&
+          !_transferCompleteCompleter!.isCompleted) {
+        _transferCompleteCompleter!.complete(false);
+      }
+    }
+
+    unawaited(_abortOutgoingPeripheralTransferIfNeeded(packet.fileId));
     _updateTransfer(packet.fileId, status: TransferStatus.cancelled);
     _cleanup(packet.fileId);
   }
@@ -964,6 +1053,25 @@ class FileTransferService extends ChangeNotifier {
   /// 取消传输
   Future<void> cancelTransfer(String fileId) async {
     try {
+      debugPrint(
+        '[FileTransfer][trace] cancel requested -> ${_shortFileId(fileId)}',
+      );
+      _bluetoothService.deferPeerTimeout();
+      _bluetoothService.clearPacketBuffer();
+      _bluetoothService.abortActiveCentralWrites();
+      await _bluetoothService.clearPeripheralTransferBuffers();
+      _resetControlPacketQueue();
+      _incomingTransferActivityAt.remove(fileId);
+      _cancelledTransferIds.add(fileId);
+      if (_transferCompleter != null && !_transferCompleter!.isCompleted) {
+        _transferCompleter!.complete(false);
+      }
+      if (_transferCompleteCompleter != null &&
+          !_transferCompleteCompleter!.isCompleted) {
+        _transferCompleteCompleter!.complete(false);
+      }
+      await _abortOutgoingPeripheralTransferIfNeeded(fileId);
+
       // 立即更新状态，让 UI 响应
       _updateTransfer(fileId, status: TransferStatus.cancelled);
 
@@ -982,12 +1090,30 @@ class FileTransferService extends ChangeNotifier {
     }
   }
 
+  Future<void> _abortOutgoingPeripheralTransferIfNeeded(String fileId) async {
+    final transfer = _activeTransfers[fileId];
+    if (transfer == null || !transfer.isOutgoing) {
+      return;
+    }
+    if (!_bluetoothService.isPeripheralConnected ||
+        (!Platform.isAndroid && !Platform.isIOS)) {
+      return;
+    }
+
+    final cleared =
+        await _bluetoothService.clearPendingPeripheralNotifications();
+    if (!cleared) {
+      debugPrint('[FileTransfer] 清空 Peripheral 待发送队列失败');
+    }
+  }
+
   /// 立即清理（用于取消操作）
   void _immediateCleanup(String fileId) {
     final completedTransfer = _activeTransfers[fileId];
     _receivedData.remove(fileId);
     _receivedChunks.remove(fileId);
     _lastAckChunk.remove(fileId);
+    _incomingTransferActivityAt.remove(fileId);
 
     if (completedTransfer != null) {
       _transferHistory.insert(0, completedTransfer);
@@ -1004,6 +1130,7 @@ class FileTransferService extends ChangeNotifier {
     _receivedData.remove(fileId);
     _receivedChunks.remove(fileId); // 清理 chunk 追踪
     _lastAckChunk.remove(fileId); // 清理批量确认追踪
+    _incomingTransferActivityAt.remove(fileId);
 
     if (completedTransfer != null) {
       _transferHistory.insert(0, completedTransfer);
@@ -1035,9 +1162,16 @@ class FileTransferService extends ChangeNotifier {
 
   Future<bool> _sendControlPacketSerialized(NearLinkPacket packet) {
     final completer = Completer<bool>();
+    final generation = _controlPacketQueueGeneration;
 
     _controlPacketSendQueue =
         _controlPacketSendQueue.catchError((_) {}).then((_) async {
+      if (generation != _controlPacketQueueGeneration) {
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        return;
+      }
       try {
         final sent = await _bluetoothService.sendPacket(packet);
         if (!completer.isCompleted) {
@@ -1051,6 +1185,68 @@ class FileTransferService extends ChangeNotifier {
     });
 
     return completer.future;
+  }
+
+  void _resetControlPacketQueue() {
+    _controlPacketQueueGeneration += 1;
+    _controlPacketSendQueue = Future.value();
+    _transferCompleter = null;
+    _transferCompleteCompleter = null;
+  }
+
+  void _startIncomingTransferWatchdog() {
+    _incomingTransferWatchdog?.cancel();
+    _incomingTransferWatchdog = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _checkIncomingTransferStalls(),
+    );
+  }
+
+  void _checkIncomingTransferStalls() {
+    if (_incomingTransferActivityAt.isEmpty) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final stalledFileIds = <String>[];
+    for (final entry in _incomingTransferActivityAt.entries) {
+      final transfer = _activeTransfers[entry.key];
+      if (transfer == null ||
+          transfer.isOutgoing ||
+          transfer.status != TransferStatus.transferring) {
+        continue;
+      }
+
+      if (now.difference(entry.value) >= _incomingTransferStallTimeout) {
+        stalledFileIds.add(entry.key);
+      }
+    }
+
+    for (final fileId in stalledFileIds) {
+      _handleIncomingTransferStalled(fileId);
+    }
+  }
+
+  void _handleIncomingTransferStalled(String fileId) {
+    final transfer = _activeTransfers[fileId];
+    if (transfer == null ||
+        transfer.isOutgoing ||
+        transfer.status != TransferStatus.transferring) {
+      _incomingTransferActivityAt.remove(fileId);
+      return;
+    }
+
+    _incomingTransferActivityAt.remove(fileId);
+    _bluetoothService.clearPacketBuffer();
+    if (_bluetoothService.isPeripheralConnected) {
+      unawaited(_bluetoothService.clearPeripheralTransferBuffers());
+    }
+    _updateTransfer(
+      fileId,
+      status: TransferStatus.failed,
+      errorMessage: '接收已中断',
+    );
+    _cleanup(fileId);
   }
 
   void _rememberCompletedIncomingTransfer(String fileId) {
@@ -1078,6 +1274,10 @@ class FileTransferService extends ChangeNotifier {
     final startTime = DateTime.now();
 
     while (DateTime.now().difference(startTime) < overallTimeout) {
+      if (_isTransferCancelled(fileId)) {
+        return false;
+      }
+
       _transferCompleteCompleter = Completer<bool>();
 
       final sent = await _bluetoothService.sendPacket(completePacket);
@@ -1120,6 +1320,7 @@ class FileTransferService extends ChangeNotifier {
   }
 
   void _markOutgoingTransferCompleted(String fileId) {
+    _cancelledTransferIds.remove(fileId);
     final transfer = _activeTransfers[fileId];
     if (transfer == null || transfer.status == TransferStatus.completed) {
       return;
@@ -1169,6 +1370,9 @@ class FileTransferService extends ChangeNotifier {
       }
     }
   }
+
+  bool _isTransferCancelled(String fileId) =>
+      _cancelledTransferIds.contains(fileId);
 
   /// 节流的进度更新（用于高频 chunk 接收）
   void _updateTransferThrottled(
@@ -1279,6 +1483,7 @@ class FileTransferService extends ChangeNotifier {
   @override
   void dispose() {
     _packetSubscription?.cancel();
+    _incomingTransferWatchdog?.cancel();
     _handshakeController.close();
     super.dispose();
   }
