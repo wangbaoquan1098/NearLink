@@ -34,10 +34,14 @@ class FileTransferService extends ChangeNotifier {
       Duration(seconds: 15);
   static const Duration _androidPeripheralTransferCompleteOverallTimeout =
       Duration(minutes: 3);
+  static const Duration _recentIncomingTransferRetention =
+      Duration(seconds: 20);
 
   StreamSubscription<NearLinkPacket>? _packetSubscription;
   Completer<bool>? _transferCompleter;
   Completer<bool>? _transferCompleteCompleter;
+  final Map<String, DateTime> _recentlyCompletedIncomingTransfers = {};
+  Future<void> _controlPacketSendQueue = Future.value();
 
   // 握手事件流
   final StreamController<String> _handshakeController =
@@ -433,10 +437,9 @@ class FileTransferService extends ChangeNotifier {
     final transfer = _activeTransfers[fileId];
     if (transfer == null) return;
 
-    final isAndroidPeripheralSender =
-        Platform.isAndroid && _bluetoothService.isPeripheralConnected;
+    final isPeripheralSender = _bluetoothService.isPeripheralConnected;
 
-    if (isAndroidPeripheralSender) {
+    if (isPeripheralSender) {
       final queueDrained =
           await _bluetoothService.waitForPeripheralSendQueueDrained();
       if (!queueDrained) {
@@ -452,7 +455,7 @@ class FileTransferService extends ChangeNotifier {
     // 等待一小段时间确保最后一个 chunk 被对方接收
     // BLE 传输可能需要一些时间才能完全到达对方
     await Future.delayed(
-      isAndroidPeripheralSender
+      isPeripheralSender
           ? const Duration(milliseconds: 100)
           : const Duration(milliseconds: 300),
     );
@@ -465,10 +468,10 @@ class FileTransferService extends ChangeNotifier {
     final ackReceived = await _waitForTransferCompleteAck(
       fileId: fileId,
       completePacket: completePacket,
-      perAttemptTimeout: isAndroidPeripheralSender
+      perAttemptTimeout: isPeripheralSender
           ? _androidPeripheralTransferCompleteRetryTimeout
           : _transferCompleteAckTimeout,
-      overallTimeout: isAndroidPeripheralSender
+      overallTimeout: isPeripheralSender
           ? _androidPeripheralTransferCompleteOverallTimeout
           : _transferCompleteAckTimeout * 3,
     );
@@ -617,7 +620,7 @@ class FileTransferService extends ChangeNotifier {
     _receivedChunks[packet.fileId] = {}; // 初始化 chunk 追踪集合
 
     // 发送确认
-    await _bluetoothService.sendPacket(NearLinkPacket(
+    await _sendControlPacketSerialized(NearLinkPacket(
       type: PacketType.fileInfoAck,
       fileId: packet.fileId,
       chunkIndex: 0,
@@ -653,20 +656,22 @@ class FileTransferService extends ChangeNotifier {
       progress: (packet.chunkIndex + 1) / packet.totalChunks,
     );
 
+    final allChunksReceived =
+        _checkAllChunksReceived(packet.fileId, packet.totalChunks);
+    if (allChunksReceived) {
+      _tryAutoCompleteTransfer(packet.fileId, packet.totalChunks);
+      return;
+    }
+
     // 批量确认逻辑：每 _batchAckInterval 个 chunk 发送一次批量确认
     // 或者如果是最后一个 chunk，立即发送确认
     final lastAck = _lastAckChunk[packet.fileId] ?? -1;
     final ackInterval = _batchAckIntervalFor(packet);
     final shouldSendBatchAck = (packet.chunkIndex - lastAck) >= ackInterval;
-    final isLastChunk = packet.chunkIndex == packet.totalChunks - 1;
-
-    if (shouldSendBatchAck || isLastChunk) {
+    if (shouldSendBatchAck) {
       _sendBatchAckAsync(packet.fileId, packet.chunkIndex);
       _lastAckChunk[packet.fileId] = packet.chunkIndex;
     }
-
-    // 检查是否收到了所有 chunk，如果是则自动完成传输
-    _tryAutoCompleteTransfer(packet.fileId, packet.totalChunks);
   }
 
   /// 异步发送批量确认，不阻塞主接收流程
@@ -675,7 +680,7 @@ class FileTransferService extends ChangeNotifier {
     Future.microtask(() async {
       try {
         // 发送批量确认，告知发送方已收到直到 lastChunkIndex 的所有 chunk
-        await _bluetoothService.sendPacket(NearLinkPacket.batchAck(
+        await _sendControlPacketSerialized(NearLinkPacket.batchAck(
           fileId: fileId,
           lastChunkIndex: lastChunkIndex,
         ));
@@ -708,22 +713,12 @@ class FileTransferService extends ChangeNotifier {
 
     // 防止重复触发
     _updateTransfer(fileId, status: TransferStatus.completed);
+    _rememberCompletedIncomingTransfer(fileId);
 
     // debugPrint('[NearLink] 已收到所有 $totalChunks 个 chunk，自动完成传输');
 
     // 立即发送完成确认（不阻塞）
-    _bluetoothService
-        .sendPacket(NearLinkPacket(
-      type: PacketType.transferCompleteAck,
-      fileId: fileId,
-      chunkIndex: 0,
-      totalChunks: 0,
-      payloadSize: 0,
-      checksum: '',
-      payload: Uint8List(0),
-      timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    ))
-        .catchError((e) {
+    _sendTransferCompleteAck(fileId).catchError((e) {
       // debugPrint('[NearLink] 自动完成确认发送失败: $e');
       return false;
     });
@@ -791,8 +786,9 @@ class FileTransferService extends ChangeNotifier {
   Future<void> _handleTransferComplete(NearLinkPacket packet) async {
     final data = _receivedData[packet.fileId];
     if (data == null) {
-      // debugPrint(
-      //     '[FileTransfer] _handleTransferComplete: data is null for fileId=${_shortFileId(packet.fileId)}...');
+      if (_wasRecentlyCompletedIncomingTransfer(packet.fileId)) {
+        await _sendTransferCompleteAck(packet.fileId);
+      }
       return;
     }
 
@@ -802,16 +798,7 @@ class FileTransferService extends ChangeNotifier {
     // 立即发送完成确认（不等待文件保存）
     // 这样可以确保发送方尽快收到确认，避免超时
     try {
-      await _bluetoothService.sendPacket(NearLinkPacket(
-        type: PacketType.transferCompleteAck,
-        fileId: packet.fileId,
-        chunkIndex: 0,
-        totalChunks: 0,
-        payloadSize: 0,
-        checksum: '',
-        payload: Uint8List(0),
-        timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      ));
+      await _sendTransferCompleteAck(packet.fileId);
       // debugPrint('[FileTransfer] _handleTransferComplete: 完成确认已发送');
     } catch (e) {
       // debugPrint('[FileTransfer] _handleTransferComplete: 发送确认失败: $e');
@@ -820,6 +807,7 @@ class FileTransferService extends ChangeNotifier {
 
     // 先更新状态为已完成，让 UI 可以响应
     _updateTransfer(packet.fileId, status: TransferStatus.completed);
+    _rememberCompletedIncomingTransfer(packet.fileId);
     // debugPrint('[FileTransfer] _handleTransferComplete: 状态已更新为 completed');
 
     // 在后台保存文件（不阻塞 UI）
@@ -1028,6 +1016,57 @@ class FileTransferService extends ChangeNotifier {
       // 使用立即刷新确保 UI 立即更新
       _notifyListenersImmediate();
     });
+  }
+
+  Future<bool> _sendTransferCompleteAck(String fileId) {
+    return _sendControlPacketSerialized(
+      NearLinkPacket(
+        type: PacketType.transferCompleteAck,
+        fileId: fileId,
+        chunkIndex: 0,
+        totalChunks: 0,
+        payloadSize: 0,
+        checksum: '',
+        payload: Uint8List(0),
+        timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      ),
+    );
+  }
+
+  Future<bool> _sendControlPacketSerialized(NearLinkPacket packet) {
+    final completer = Completer<bool>();
+
+    _controlPacketSendQueue =
+        _controlPacketSendQueue.catchError((_) {}).then((_) async {
+      try {
+        final sent = await _bluetoothService.sendPacket(packet);
+        if (!completer.isCompleted) {
+          completer.complete(sent);
+        }
+      } catch (e, stackTrace) {
+        if (!completer.isCompleted) {
+          completer.completeError(e, stackTrace);
+        }
+      }
+    });
+
+    return completer.future;
+  }
+
+  void _rememberCompletedIncomingTransfer(String fileId) {
+    _recentlyCompletedIncomingTransfers[fileId] = DateTime.now();
+  }
+
+  bool _wasRecentlyCompletedIncomingTransfer(String fileId) {
+    final completedAt = _recentlyCompletedIncomingTransfers[fileId];
+    if (completedAt == null) return false;
+
+    final isRecent = DateTime.now().difference(completedAt) <=
+        _recentIncomingTransferRetention;
+    if (!isRecent) {
+      _recentlyCompletedIncomingTransfers.remove(fileId);
+    }
+    return isRecent;
   }
 
   Future<bool> _waitForTransferCompleteAck({

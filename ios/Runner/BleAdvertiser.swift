@@ -333,33 +333,26 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        print("[BleAdvertiser] didSubscribeTo: central=\(central.identifier.uuidString), char=\(characteristic.uuid)")
-
         // 新设备连接，清理之前的缓冲区（避免残留数据影响新传输）
         if !reassemblyBuffer.isEmpty {
-            print("[BleAdvertiser] didSubscribeTo: clearing stale reassembly buffer (\(reassemblyBuffer.count) bytes)")
             reassemblyBuffer = Data()
         }
         if !pendingDataQueue.isEmpty {
-            print("[BleAdvertiser] didSubscribeTo: clearing stale pending queue (\(pendingDataQueue.count) items)")
             pendingDataQueue.removeAll()
         }
 
         // 记录连接的中心设备
         if !connectedCentrals.contains(where: { $0.identifier == central.identifier }) {
             connectedCentrals.append(central)
-            print("[BleAdvertiser] didSubscribeTo: added central to connectedCentrals (total: \(connectedCentrals.count))")
         }
 
         // 停止广播（有设备连接后不再广播）
         if isAdvertising {
             stopAdvertising()
-            print("[BleAdvertiser] didSubscribeTo: stopped advertising")
         }
 
         // 存储协商的 MTU
         negotiatedMtu = central.maximumUpdateValueLength
-        print("[BleAdvertiser] didSubscribeTo: negotiated MTU = \(negotiatedMtu)")
         
         // 通知 Flutter 有设备连接
         let eventData: [String: Any] = [
@@ -368,7 +361,6 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             "mtu": negotiatedMtu
         ]
         emitEvent(eventData)
-        print("[BleAdvertiser] didSubscribeTo: sent centralConnected event to Flutter (pending queue: \(pendingDataQueue.count))")
         
         // 发送队列中的所有待处理数据
         flushPendingDataQueue()
@@ -377,21 +369,16 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     /// 批量添加数据到发送队列（高效批量发送）
     func sendDataBatch(_ packets: [Data]) -> Bool {
         guard let peripheral = peripheralManager, peripheral.state == .poweredOn else {
-            print("[BleAdvertiser] sendDataBatch: peripheral not powered on")
             return false
         }
 
         // 检查是否有已连接的中心设备
         if connectedCentrals.isEmpty {
-            print("[BleAdvertiser] sendDataBatch: no connected centrals")
             return false
         }
-
-        let queueSizeBefore = pendingDataQueue.count
         for packet in packets {
             enqueueSegmentedData(packet)
         }
-        // print("[BleAdvertiser] sendDataBatch: added \(packets.count) packets as \(pendingDataQueue.count - queueSizeBefore) fragments, queue size: \(pendingDataQueue.count)")
 
         // 立即开始发送
         flushPendingDataQueueFast()
@@ -494,27 +481,19 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         // 注意：取消订阅不等于断开连接，只是设备暂时不需要通知
-        // 不要移除设备，也不要通知断开，只记录日志
-        print("[BleAdvertiser] 中心设备 \(central.identifier.uuidString) 取消订阅，等待重新订阅...")
-        
         // 不移除设备，因为它仍然连接着，只是暂时取消订阅
         // 当设备重新订阅时，didSubscribeTo 会被调用
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didDisconnectCentral central: CBCentral, error: Error?) {
-        // 完全断开连接时调用（iOS 11+）
-        print("[BleAdvertiser] 中心设备完全断开: \(central.identifier.uuidString), error: \(error?.localizedDescription ?? "none")")
-
         // 移除断开的设备
         connectedCentrals.removeAll { $0.identifier == central.identifier }
 
         // 清理缓冲区，避免影响下次传输
         if !reassemblyBuffer.isEmpty {
-            print("[BleAdvertiser] 清理重组缓冲区 (\(reassemblyBuffer.count) bytes)")
             reassemblyBuffer = Data()
         }
         if !pendingDataQueue.isEmpty {
-            print("[BleAdvertiser] 清理发送队列 (\(pendingDataQueue.count) items)")
             pendingDataQueue.removeAll()
         }
 
@@ -527,14 +506,12 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         
         // 如果仍然有其他连接的设备，不需要重新广播
         if !connectedCentrals.isEmpty {
-            print("[BleAdvertiser] 仍有 \(connectedCentrals.count) 个设备连接，不重新广播")
             return
         }
         
         // 所有设备都断开了，自动重新开始广播以便接收新的连接
         // 这样用户不需要手动重新开启广播
         if peripheralManager?.state == .poweredOn && !isAdvertising {
-            print("[BleAdvertiser] 自动重新开始广播")
             startAdvertising(deviceName: pendingDeviceName)
         }
     }
@@ -543,20 +520,17 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     /// 数据会自动分块发送以适应 MTU
     func sendDataToCentrals(_ data: Data) -> Bool {
         guard let txChar = txCharacteristic else {
-            print("[BleAdvertiser] sendDataToCentrals: txCharacteristic is nil")
             return false
         }
 
         // 检查蓝牙是否开启
         guard let peripheral = peripheralManager, peripheral.state == .poweredOn else {
-            print("[BleAdvertiser] sendDataToCentrals: peripheralManager not powered on, state=\(peripheralManager?.state.rawValue ?? -1)")
             enqueueSegmentedData(data)
             return false
         }
 
         // 检查是否有已连接的中心设备
         if connectedCentrals.isEmpty {
-            print("[BleAdvertiser] sendDataToCentrals: no connected centrals, queueing data")
             enqueueSegmentedData(data)
             return false
         }
@@ -583,6 +557,11 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     /// 获取已连接的中心设备数量
     func getConnectedCentralsCount() -> Int {
         return connectedCentrals.count
+    }
+
+    /// 获取当前待发送分片数量
+    func getPendingNotificationCount() -> Int {
+        return pendingDataQueue.count
     }
     
     // MARK: - 连接状态监听
@@ -699,6 +678,9 @@ extension BleAdvertiser: FlutterStreamHandler {
                 
             case "getConnectedCentralsCount":
                 result(self.getConnectedCentralsCount())
+
+            case "getPendingNotificationCount":
+                result(self.getPendingNotificationCount())
                 
             default:
                 result(FlutterMethodNotImplemented)
@@ -717,9 +699,7 @@ extension BleAdvertiser: FlutterStreamHandler {
     // MARK: - FlutterStreamHandler
     
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        print("[BleAdvertiser] onListen: eventSink setup")
         self.eventSink = events
-        print("[BleAdvertiser] onListen: eventSink ready")
 
         if pendingEvents.first(where: { ($0["event"] as? String) == "centralConnected" }) == nil {
             for central in connectedCentrals {

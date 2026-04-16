@@ -297,9 +297,7 @@ class NearLinkBluetoothService extends ChangeNotifier {
     String? nearLinkName = androidAdvertiserName;
 
     // 如果 Manufacturer Data 方式失败，尝试从服务 UUID 和本地名称识别 (iOS 广播方式)
-    if (nearLinkName == null) {
-      nearLinkName = _extractNearLinkNameFromServiceData(advData);
-    }
+    nearLinkName ??= _extractNearLinkNameFromServiceData(advData);
 
     // 如果不是 NearLink 设备，直接忽略
     if (nearLinkName == null) {
@@ -783,9 +781,6 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
         for (final char in service.characteristics) {
           final charUuid = char.uuid.str.toUpperCase();
-          debugPrint(
-              '[NearLink] 发现特征值: $charUuid, properties: ${char.properties}');
-
           // 支持完整格式和短格式
           final isTxChar =
               charUuid == NearLinkConstants.charTxUuid.toUpperCase() ||
@@ -798,12 +793,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
           if (isTxChar) {
             _txCharacteristic = char;
-            debugPrint('[NearLink] 设置 TX 特征值: $charUuid');
 
             // 订阅 TX 通知来接收数据
             if (char.properties.notify) {
               try {
-                debugPrint('[NearLink] 正在订阅 TX 通知...');
                 await _txCharacteristic!.setNotifyValue(true);
 
                 // 等待订阅生效 - 增加等待时间
@@ -811,41 +804,28 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
                 // 检查订阅状态
                 final notifying = _txCharacteristic!.isNotifying;
-                debugPrint('[NearLink] TX 通知状态: isNotifying=$notifying');
 
                 if (!notifying) {
-                  debugPrint('[NearLink] 重新订阅 TX 通知...');
                   await Future.delayed(const Duration(milliseconds: 300));
                   await _txCharacteristic!.setNotifyValue(true);
-                  debugPrint(
-                      '[NearLink] 重新订阅完成，状态: ${_txCharacteristic!.isNotifying}');
                 }
 
                 // 取消之前的订阅
                 await _rxSubscription?.cancel();
 
                 // 使用 lastValueStream 接收所有数据通知
-                debugPrint('[NearLink] 设置 TX 数据监听...');
                 _rxSubscription = _txCharacteristic!.lastValueStream.listen(
                   (data) {
-                    debugPrint('[NearLink] 收到 TX 数据: ${data.length} bytes');
                     // 每次收到通知都调用 _onDataReceived
                     // 它内部会处理粘包和分包
                     _onDataReceived(Uint8List.fromList(data));
                   },
-                  onDone: () {
-                    debugPrint('[NearLink] TX lastValueStream 已关闭');
-                  },
-                  onError: (error) {
-                    debugPrint('[NearLink] TX lastValueStream 错误: $error');
-                  },
+                  onDone: () {},
+                  onError: (_) {},
                 );
-                debugPrint('[NearLink] TX 通知订阅完成');
               } catch (e) {
                 debugPrint('[NearLink] 订阅 TX 通知失败: $e');
               }
-            } else {
-              debugPrint('[NearLink] TX 特征值不支持 notify，无法订阅');
             }
           } else if (isRxChar) {
             _rxCharacteristic = char;
@@ -1058,9 +1038,8 @@ class NearLinkBluetoothService extends ChangeNotifier {
       // 检查特征值是否支持不带响应写入
       final bool canWriteWithoutResponse =
           _rxCharacteristic!.properties.writeWithoutResponse;
-      final int writeWindowSize = canWriteWithoutResponse
-          ? (isTargetIOS ? 4 : 8)
-          : 1;
+      final int writeWindowSize =
+          canWriteWithoutResponse ? (isTargetIOS ? 4 : 8) : 1;
       final pendingWrites = <Future<void>>[];
 
       final int chunkSize = isTargetIOS ? 180 : 512;
@@ -1175,7 +1154,7 @@ class NearLinkBluetoothService extends ChangeNotifier {
   }
 
   Future<int> getPendingPeripheralNotificationCount() async {
-    if (!Platform.isAndroid || !_isPeripheralConnected) {
+    if (!_isPeripheralConnected || (!Platform.isAndroid && !Platform.isIOS)) {
       return 0;
     }
 
@@ -1193,7 +1172,7 @@ class NearLinkBluetoothService extends ChangeNotifier {
     Duration timeout = _androidPeripheralQueueDrainTimeout,
     Duration pollInterval = _androidPeripheralQueuePollInterval,
   }) async {
-    if (!Platform.isAndroid || !_isPeripheralConnected) {
+    if (!_isPeripheralConnected || (!Platform.isAndroid && !Platform.isIOS)) {
       return true;
     }
 

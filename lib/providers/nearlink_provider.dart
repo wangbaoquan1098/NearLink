@@ -1,10 +1,8 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import '../bluetooth/nearlink_bluetooth_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../bluetooth/nearlink_bluetooth_service.dart';
 import '../models/nearlink_models.dart';
@@ -65,14 +63,14 @@ class NearLinkProvider extends ChangeNotifier {
 
   // 状态
   bool _isInitialized = false;
-  bool _isInitializing = false;  // 防止重复初始化
+  bool _isInitializing = false; // 防止重复初始化
   bool _isDarkMode = false;
   String? _currentDeviceName;
   String? _selectedFilePath;
   Uint8List? _selectedFileBytes; // 用于存储从 image_picker 选择的文件字节
   String? _selectedFileName; // 存储文件名
   bool _compressImages = false; // 是否压缩图片
-  
+
   // 连接成功的设备信息
   NearbyDevice? _connectedRemoteDevice;
 
@@ -104,14 +102,18 @@ class NearLinkProvider extends ChangeNotifier {
   bool get isInitialized => _isInitialized;
   bool get isDarkMode => _isDarkMode;
   bool get compressImages => _compressImages;
-  NearLinkConnectionState get connectionState => _bluetoothService.connectionState;
-  List<NearbyDevice> get discoveredDevices => _bluetoothService.discoveredDevices;
+  NearLinkConnectionState get connectionState =>
+      _bluetoothService.connectionState;
+  List<NearbyDevice> get discoveredDevices =>
+      _bluetoothService.discoveredDevices;
   BluetoothDevice? get connectedDevice => _bluetoothService.connectedDevice;
   bool get isConnected => _bluetoothService.isConnected;
   String? get errorMessage => _bluetoothService.errorMessage;
   String get deviceName => _currentDeviceName ?? 'NearLink';
-  List<FileTransfer> get activeTransfers => _fileTransferService.activeTransfers;
+  List<FileTransfer> get activeTransfers =>
+      _fileTransferService.activeTransfers;
   String? get lastIncomingDeviceName => _lastIncomingDeviceName;
+
   /// 返回当前传输任务的副本，确保 Selector 能检测到内部属性变化
   FileTransfer? get currentTransfer {
     final transfer = _fileTransferService.currentTransfer;
@@ -129,8 +131,10 @@ class NearLinkProvider extends ChangeNotifier {
       status: transfer.status,
       startTime: transfer.startTime,
       errorMessage: transfer.errorMessage,
+      isOutgoing: transfer.isOutgoing,
     );
   }
+
   bool get isIOS => _iosAdapter.isIOS;
   NearbyDevice? get connectedRemoteDevice => _connectedRemoteDevice;
 
@@ -140,7 +144,7 @@ class NearLinkProvider extends ChangeNotifier {
   DateTime? get advertiseStartTime => _bluetoothService.advertiseStartTime;
   int? get advertiseDuration => _bluetoothService.advertiseDuration;
   bool get isAdvertiseTimeout => _bluetoothService.isAdvertiseTimeout;
-  
+
   // iOS 作为 Peripheral 被连接的 Getters
   bool get isPeripheralConnected => _bluetoothService.isPeripheralConnected;
   String? get connectedCentralId => _bluetoothService.connectedCentralId;
@@ -151,7 +155,8 @@ class NearLinkProvider extends ChangeNotifier {
     if (_isInitialized || _isInitializing) return;
     _isInitializing = true;
 
-    _currentDeviceName = 'NearLink-${DateTime.now().millisecondsSinceEpoch % 10000}';
+    _currentDeviceName =
+        'NearLink-${DateTime.now().millisecondsSinceEpoch % 10000}';
 
     // 加载保存的深色模式设置
     await _loadDarkModePreference();
@@ -194,8 +199,6 @@ class NearLinkProvider extends ChangeNotifier {
   /// 检查并请求权限（在需要时调用，如点击扫描按钮）
   /// 返回 true 表示权限已获取，可以继续操作
   Future<bool> checkAndRequestPermissions(BuildContext context) async {
-    debugPrint('[NearLinkProvider] 检查权限，平台: ${Platform.operatingSystem}');
-
     // 先检查蓝牙是否开启
     final adapterState = await FlutterBluePlus.adapterState.first;
     if (adapterState != BluetoothAdapterState.on) {
@@ -206,17 +209,20 @@ class NearLinkProvider extends ChangeNotifier {
     }
 
     final hasPermissions = await _permissionService.hasBluetoothPermissions();
-    debugPrint('[NearLinkProvider] 权限检查结果: $hasPermissions');
     if (hasPermissions) {
       return true;
     }
 
     // 检查是否被永久拒绝
-    final isPermanentlyDenied = await _permissionService.isBluetoothPermissionPermanentlyDenied();
-    debugPrint('[NearLinkProvider] 是否永久拒绝: $isPermanentlyDenied');
+    final isPermanentlyDenied =
+        await _permissionService.isBluetoothPermissionPermanentlyDenied();
     if (isPermanentlyDenied && context.mounted) {
       // 权限被永久拒绝，直接引导去设置
       _showPermissionDeniedDialog(context);
+      return false;
+    }
+
+    if (!context.mounted) {
       return false;
     }
 
@@ -228,7 +234,9 @@ class NearLinkProvider extends ChangeNotifier {
 
     // 请求权限
     final granted = await _permissionService.requestBluetoothPermissions();
-    debugPrint('[NearLinkProvider] 权限请求结果: $granted');
+    if (!context.mounted) {
+      return granted;
+    }
     if (!granted && context.mounted) {
       // 权限被拒绝，提示用户
       _showPermissionDeniedDialog(context);
@@ -241,11 +249,11 @@ class NearLinkProvider extends ChangeNotifier {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: Row(
+        title: const Row(
           children: [
             Icon(Icons.bluetooth_disabled, color: NearLinkColors.error),
-            const SizedBox(width: 8),
-            const Text('蓝牙未开启'),
+            SizedBox(width: 8),
+            Text('蓝牙未开启'),
           ],
         ),
         content: const Text('请在系统设置中开启蓝牙后重试。'),
@@ -265,7 +273,7 @@ class NearLinkProvider extends ChangeNotifier {
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: Row(
+        title: const Row(
           children: [
             Icon(Icons.bluetooth, color: NearLinkColors.primary),
             SizedBox(width: 8),
@@ -276,15 +284,17 @@ class NearLinkProvider extends ChangeNotifier {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('NearLink 需要以下权限来发现和连接附近设备：'),
-            SizedBox(height: 12),
-            _PermissionItem(icon: Icons.bluetooth, text: '蓝牙扫描和连接'),
+            const Text('NearLink 需要以下权限来发现和连接附近设备：'),
+            const SizedBox(height: 12),
+            const _PermissionItem(icon: Icons.bluetooth, text: '蓝牙扫描和连接'),
             if (Platform.isAndroid)
-              _PermissionItem(icon: Icons.location_on, text: '位置信息（系统要求用于蓝牙扫描）'),
-            SizedBox(height: 12),
-            Text(
+              const _PermissionItem(
+                  icon: Icons.location_on, text: '位置信息（系统要求用于蓝牙扫描）'),
+            const SizedBox(height: 12),
+            const Text(
               '所有数据传输仅在设备间直接进行，不会上传至服务器。',
-              style: TextStyle(fontSize: 12, color: NearLinkColors.textSecondary),
+              style:
+                  TextStyle(fontSize: 12, color: NearLinkColors.textSecondary),
             ),
           ],
         ),
@@ -314,11 +324,11 @@ class NearLinkProvider extends ChangeNotifier {
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: Row(
+        title: const Row(
           children: [
             Icon(Icons.bluetooth_disabled, color: NearLinkColors.error),
-            const SizedBox(width: 8),
-            const Text('蓝牙权限被拒绝'),
+            SizedBox(width: 8),
+            Text('蓝牙权限被拒绝'),
           ],
         ),
         content: Column(
@@ -368,12 +378,14 @@ class NearLinkProvider extends ChangeNotifier {
 
   /// 蓝牙服务状态变化回调
   void _onBluetoothServiceChanged() {
-    if (!_bluetoothService.isConnected && !_bluetoothService.isPeripheralConnected) {
+    if (!_bluetoothService.isConnected &&
+        !_bluetoothService.isPeripheralConnected) {
       _connectedRemoteDevice = null;
     }
 
     // 检测 iOS 作为 Peripheral 被连接的状态变化
-    if (_bluetoothService.isPeripheralConnected && _lastIncomingDeviceName == null) {
+    if (_bluetoothService.isPeripheralConnected &&
+        _lastIncomingDeviceName == null) {
       // iOS 被连接，触发被动连接事件
       _lastIncomingDeviceName = 'Android 设备';
       _lastIncomingDeviceId = _bluetoothService.connectedCentralId;
@@ -384,18 +396,19 @@ class NearLinkProvider extends ChangeNotifier {
         deviceType: DeviceType.phone,
         isIncoming: true,
       ));
-    } else if (!_bluetoothService.isPeripheralConnected && _lastIncomingDeviceName != null) {
+    } else if (!_bluetoothService.isPeripheralConnected &&
+        _lastIncomingDeviceName != null) {
       // iOS 断开连接，清除状态
       _lastIncomingDeviceName = null;
       _lastIncomingDeviceId = null;
-      
+
       // 取消正在进行的文件传输
       _cancelActiveTransfers();
     }
-    
+
     notifyListeners();
   }
-  
+
   /// 取消所有活跃的文件传输
   void _cancelActiveTransfers() {
     final activeTransfers = _fileTransferService.activeTransfers;
@@ -409,16 +422,17 @@ class NearLinkProvider extends ChangeNotifier {
   /// 文件传输服务状态变化回调
   void _onFileTransferChanged() {
     final activeTransfers = _fileTransferService.activeTransfers;
-    
+
     // 1. 通知 UI 更新进度（每次状态变化都需要）
     notifyListeners();
-    
+
     // 2. 检查是否有新的接收中的传输，只在首次检测到时触发界面跳转
     if (activeTransfers.isNotEmpty) {
-      final receivingTransfers = activeTransfers.where(
-        (t) => !t.isOutgoing && t.status == TransferStatus.transferring
-      ).toList();
-      
+      final receivingTransfers = activeTransfers
+          .where(
+              (t) => !t.isOutgoing && t.status == TransferStatus.transferring)
+          .toList();
+
       for (final transfer in receivingTransfers) {
         // 只在尚未通知过的传输上触发界面跳转
         if (!_notifiedReceiveFileIds.contains(transfer.fileId)) {
@@ -428,7 +442,7 @@ class NearLinkProvider extends ChangeNotifier {
         }
       }
     }
-    
+
     // 3. 清理已完成或取消的传输的记录
     final activeFileIds = activeTransfers.map((t) => t.fileId).toSet();
     _notifiedReceiveFileIds.removeWhere((id) => !activeFileIds.contains(id));
@@ -440,14 +454,15 @@ class NearLinkProvider extends ChangeNotifier {
     // 就不再触发新的连接提示
     if (_lastIncomingDeviceName != null) {
       // 更新设备名称（如果握手提供了更准确的名称）
-      if (_lastIncomingDeviceName == 'Android 设备' || _lastIncomingDeviceName == 'iOS 设备') {
+      if (_lastIncomingDeviceName == 'Android 设备' ||
+          _lastIncomingDeviceName == 'iOS 设备') {
         _lastIncomingDeviceName = deviceName;
       }
       return;
     }
-    
+
     _lastIncomingDeviceName = deviceName;
-    
+
     // 通知 UI 显示连接成功提示
     _incomingConnectionController.add(ConnectionSuccessEvent(
       deviceName: deviceName,
@@ -535,7 +550,7 @@ class NearLinkProvider extends ChangeNotifier {
     notifyListeners();
 
     final success = await _bluetoothService.connectToDevice(device);
-    
+
     if (success) {
       // 保存连接的设备信息
       _connectedRemoteDevice = device;
@@ -544,7 +559,7 @@ class NearLinkProvider extends ChangeNotifier {
     } else {
       _updateConnectionState(NearLinkConnectionState.disconnected);
     }
-    
+
     notifyListeners();
     return success;
   }
@@ -579,11 +594,12 @@ class NearLinkProvider extends ChangeNotifier {
   }
 
   /// 检查是否有选中的文件（路径或字节）
-  bool get hasSelectedFile => _selectedFilePath != null || _selectedFileBytes != null;
+  bool get hasSelectedFile =>
+      _selectedFilePath != null || _selectedFileBytes != null;
 
   /// 获取选中的文件名
-  String? get selectedFileName => _selectedFilePath != null 
-      ? _selectedFilePath!.split('/').last 
+  String? get selectedFileName => _selectedFilePath != null
+      ? _selectedFilePath!.split('/').last
       : _selectedFileName;
 
   /// 获取选中的文件字节数据
@@ -593,9 +609,9 @@ class NearLinkProvider extends ChangeNotifier {
   Future<FileTransfer?> sendFile({bool? compressImage}) async {
     // 如果未指定压缩选项，使用用户设置
     final shouldCompress = compressImage ?? _compressImages;
-    
+
     FileTransfer? transfer;
-    
+
     if (_selectedFileBytes != null && _selectedFileName != null) {
       // 使用 image_picker 传入的字节数据
       transfer = await _fileTransferService.prepareFileWithBytes(
@@ -612,7 +628,7 @@ class NearLinkProvider extends ChangeNotifier {
     } else {
       return null;
     }
-    
+
     if (transfer != null) {
       await _fileTransferService.startSend(transfer.fileId);
     }

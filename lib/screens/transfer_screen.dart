@@ -151,7 +151,8 @@ class _TransferScreenState extends State<TransferScreen> {
     scaffoldMessenger.showSnackBar(
       SnackBar(
         content: Text(
-            '${transfer.filePath.isNotEmpty ? "发送" : "接收"}完成: ${transfer.fileName}'),
+          '${transfer.isOutgoing ? "发送" : "接收"}完成: ${transfer.fileName}',
+        ),
         backgroundColor: NearLinkColors.success,
         duration: const Duration(seconds: 1),
       ),
@@ -648,7 +649,7 @@ class _TransferProgressWidget extends StatelessWidget {
                           borderRadius: BorderRadius.circular(20),
                         ),
                         child: Text(
-                          _getStatusText(transfer.status),
+                          _getStatusText(transfer),
                           style: TextStyle(
                             color: _getStatusColor(transfer.status),
                             fontWeight: FontWeight.w600,
@@ -730,7 +731,7 @@ class _TransferProgressWidget extends StatelessWidget {
         children: [
           _buildDetailItem(
             Icons.storage,
-            '已传输',
+            transfer.isOutgoing ? '已发送' : '已接收',
             _formatFileSize((transfer.fileSize * transfer.progress).toInt()),
           ),
           Container(
@@ -803,13 +804,14 @@ class _TransferProgressWidget extends StatelessWidget {
     return FileUtils.getFileIcon(mimeType);
   }
 
-  String _getStatusText(TransferStatus status) {
+  String _getStatusText(FileTransfer transfer) {
+    final status = transfer.status;
     return switch (status) {
       TransferStatus.idle => '等待开始',
       TransferStatus.connecting => '连接中...',
       TransferStatus.handshaking => '握手...',
-      TransferStatus.transferring => '传输中...',
-      TransferStatus.completed => '传输完成',
+      TransferStatus.transferring => transfer.isOutgoing ? '发送中...' : '接收中...',
+      TransferStatus.completed => transfer.isOutgoing ? '发送完成' : '接收完成',
       TransferStatus.failed => '传输失败',
       TransferStatus.cancelled => '已取消',
     };

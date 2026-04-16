@@ -162,12 +162,10 @@ class MainActivity : FlutterActivity() {
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     eventSink = events
-                    android.util.Log.d("NearLink", "Flutter 开始监听事件")
                 }
                 
                 override fun onCancel(arguments: Any?) {
                     eventSink = null
-                    android.util.Log.d("NearLink", "Flutter 取消监听事件")
                 }
             }
         )
@@ -177,7 +175,6 @@ class MainActivity : FlutterActivity() {
         // 设置 GATT Server 连接回调
         gattServer?.setConnectionCallback(object : BleGattServer.ConnectionCallback {
             override fun onDeviceConnected(device: BluetoothDevice) {
-                android.util.Log.d("NearLink", "GATT 设备已连接: ${device.address}")
                 connectedDevice = device
                 
                 emitEvent(
@@ -190,7 +187,6 @@ class MainActivity : FlutterActivity() {
             }
             
             override fun onDeviceDisconnected(device: BluetoothDevice) {
-                android.util.Log.d("NearLink", "GATT 设备已断开: ${device.address}")
                 if (connectedDevice?.address == device.address) {
                     connectedDevice = null
                 }

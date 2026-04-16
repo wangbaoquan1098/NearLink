@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -16,7 +15,6 @@ class PermissionService {
     // 只需要检查状态是否是 unauthorized
     if (Platform.isIOS) {
       final adapterState = await FlutterBluePlus.adapterState.first;
-      debugPrint('[PermissionService] iOS adapterState: $adapterState');
       // unauthorized 表示权限被拒绝，其他状态都表示有权限（系统已授权或不需要授权）
       return adapterState != BluetoothAdapterState.unauthorized;
     }
@@ -27,8 +25,6 @@ class PermissionService {
     final scanStatus = await Permission.bluetoothScan.status;
     final connectStatus = await Permission.bluetoothConnect.status;
     final advertiseStatus = await Permission.bluetoothAdvertise.status;
-
-    debugPrint('[PermissionService] Android请求前状态 - scan: ${scanStatus.name}, connect: ${connectStatus.name}, advertise: ${advertiseStatus.name}');
 
     if (scanStatus.isDenied) {
       permissions.add(Permission.bluetoothScan);
@@ -45,17 +41,14 @@ class PermissionService {
       permissions.add(Permission.locationWhenInUse);
     }
 
-    debugPrint('[PermissionService] 需要请求的权限: $permissions');
-
     if (permissions.isEmpty) {
       return true;
     }
 
     final results = await permissions.request();
-    debugPrint('[PermissionService] 请求结果: $results');
 
-    return results.values.every((status) =>
-        status.isGranted || status.isLimited);
+    return results.values
+        .every((status) => status.isGranted || status.isLimited);
   }
 
   /// 检查蓝牙权限
@@ -63,7 +56,6 @@ class PermissionService {
     // iOS 使用 flutter_blue_plus 的蓝牙状态来检查权限
     if (Platform.isIOS) {
       final adapterState = await FlutterBluePlus.adapterState.first;
-      debugPrint('[PermissionService] iOS adapterState: $adapterState');
       // unauthorized 表示没有权限，其他状态（on/off）都表示有权限
       return adapterState != BluetoothAdapterState.unauthorized;
     }
@@ -72,8 +64,6 @@ class PermissionService {
     final bluetoothScan = await Permission.bluetoothScan.status;
     final bluetoothConnect = await Permission.bluetoothConnect.status;
     final location = await Permission.locationWhenInUse.status;
-
-    debugPrint('[PermissionService] Android bluetoothScan: ${bluetoothScan.name}, bluetoothConnect: ${bluetoothConnect.name}, location: ${location.name}');
 
     return bluetoothScan.isGranted &&
         bluetoothConnect.isGranted &&
@@ -90,7 +80,8 @@ class PermissionService {
 
     final bluetoothScan = await Permission.bluetoothScan.status;
     final bluetoothConnect = await Permission.bluetoothConnect.status;
-    return bluetoothScan.isPermanentlyDenied || bluetoothConnect.isPermanentlyDenied;
+    return bluetoothScan.isPermanentlyDenied ||
+        bluetoothConnect.isPermanentlyDenied;
   }
 
   /// 请求存储权限
