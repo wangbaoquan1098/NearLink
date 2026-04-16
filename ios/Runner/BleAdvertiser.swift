@@ -31,6 +31,8 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     // Flutter Event Channel（用于向Flutter发送连接事件）
     private var eventChannel: FlutterEventChannel?
     private var eventSink: FlutterEventSink?
+    private var pendingEvents: [[String: Any]] = []
+    private var channelsConfigured = false
     
     // 数据包重组缓冲区
     private var reassemblyBuffer: Data = Data()
@@ -44,6 +46,14 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         super.init()
         // 初始化外围设备管理器
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+    }
+
+    private func emitEvent(_ eventData: [String: Any]) {
+        if let sink = eventSink {
+            sink(eventData)
+        } else {
+            pendingEvents.append(eventData)
+        }
     }
     
     /// 开始广播（供 Dart 层调用）
@@ -69,6 +79,34 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         shouldStartAdvertising = false
         peripheralManager?.stopAdvertising()
         isAdvertising = false
+    }
+
+    /// 主动断开所有已连接的中心设备
+    func disconnect() {
+        shouldStartAdvertising = false
+        stopAdvertising()
+
+        let disconnectedCentrals = connectedCentrals
+        connectedCentrals.removeAll()
+        pendingDataQueue.removeAll()
+        reassemblyBuffer = Data()
+        negotiatedMtu = 185
+
+        peripheralManager?.removeAllServices()
+        txCharacteristic = nil
+        rxCharacteristic = nil
+        nearlinkService = nil
+        isServiceAdded = false
+
+        for central in disconnectedCentrals {
+            emitEvent([
+                "event": "centralDisconnected",
+                "centralId": central.identifier.uuidString
+            ])
+        }
+
+        // 重建 peripheral manager，确保已连接的 central 真正失效，后续也能重新广播。
+        peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
     }
     
     /// 内部开始广播
@@ -187,14 +225,20 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
+        // 高频打印已禁用以提升性能
+        // print("[BleAdvertiser] didReceiveWrite: received \(requests.count) requests")
+
         // 合并所有请求的数据
         var combinedData = Data()
-        for request in requests {
+        for (_, request) in requests.enumerated() {
             if let value = request.value {
+                // print("[BleAdvertiser] request[\(index)]: characteristic=\(request.characteristic.uuid), dataSize=\(value.count)")
                 combinedData.append(value)
             }
         }
-        
+
+        // print("[BleAdvertiser] combinedData size: \(combinedData.count)")
+
         if combinedData.isEmpty {
             for request in requests {
                 if request.characteristic.properties.contains(.write) {
@@ -203,10 +247,10 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             }
             return
         }
-        
+
         // 将数据加入重组缓冲区
         reassemblyBuffer.append(combinedData)
-        
+
         // 处理重组缓冲区的数据
         processReassemblyBuffer()
         
@@ -220,6 +264,7 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     /// 处理重组缓冲区，尝试解析完整的包
     private func processReassemblyBuffer() {
+        // 高频打印已禁用以提升性能
         // 循环处理，直到缓冲区数据不足或处理完所有完整包
         while reassemblyBuffer.count >= nearlinkHeaderSize {
             // 验证协议头
@@ -273,14 +318,12 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             reassemblyBuffer = reassemblyBuffer.subdata(in: totalPacketLength..<reassemblyBuffer.count)
             
             // 转发给 Flutter
-            if let sink = eventSink {
-                let eventData: [String: Any] = [
-                    "event": "dataReceived",
-                    "characteristicUuid": "0000FF02-0000-1000-8000-00805F9B34FB",
-                    "data": FlutterStandardTypedData(bytes: packet)
-                ]
-                sink(eventData)
-            }
+            let eventData: [String: Any] = [
+                "event": "dataReceived",
+                "characteristicUuid": "0000FF02-0000-1000-8000-00805F9B34FB",
+                "data": FlutterStandardTypedData(bytes: packet)
+            ]
+            emitEvent(eventData)
             
             // 如果缓冲区还有数据，递归处理
             if reassemblyBuffer.count >= nearlinkHeaderSize {
@@ -291,19 +334,29 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
         print("[BleAdvertiser] didSubscribeTo: central=\(central.identifier.uuidString), char=\(characteristic.uuid)")
-        
+
+        // 新设备连接，清理之前的缓冲区（避免残留数据影响新传输）
+        if !reassemblyBuffer.isEmpty {
+            print("[BleAdvertiser] didSubscribeTo: clearing stale reassembly buffer (\(reassemblyBuffer.count) bytes)")
+            reassemblyBuffer = Data()
+        }
+        if !pendingDataQueue.isEmpty {
+            print("[BleAdvertiser] didSubscribeTo: clearing stale pending queue (\(pendingDataQueue.count) items)")
+            pendingDataQueue.removeAll()
+        }
+
         // 记录连接的中心设备
         if !connectedCentrals.contains(where: { $0.identifier == central.identifier }) {
             connectedCentrals.append(central)
             print("[BleAdvertiser] didSubscribeTo: added central to connectedCentrals (total: \(connectedCentrals.count))")
         }
-        
+
         // 停止广播（有设备连接后不再广播）
         if isAdvertising {
             stopAdvertising()
             print("[BleAdvertiser] didSubscribeTo: stopped advertising")
         }
-        
+
         // 存储协商的 MTU
         negotiatedMtu = central.maximumUpdateValueLength
         print("[BleAdvertiser] didSubscribeTo: negotiated MTU = \(negotiatedMtu)")
@@ -314,23 +367,128 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             "centralId": central.identifier.uuidString,
             "mtu": negotiatedMtu
         ]
-        eventSink?(eventData)
+        emitEvent(eventData)
         print("[BleAdvertiser] didSubscribeTo: sent centralConnected event to Flutter (pending queue: \(pendingDataQueue.count))")
         
         // 发送队列中的所有待处理数据
         flushPendingDataQueue()
     }
     
-    /// 发送队列中的所有待处理数据
-    private func flushPendingDataQueue() {
-        print("[BleAdvertiser] flushPendingDataQueue: queue size = \(pendingDataQueue.count)")
-        while !pendingDataQueue.isEmpty {
+    /// 批量添加数据到发送队列（高效批量发送）
+    func sendDataBatch(_ packets: [Data]) -> Bool {
+        guard let peripheral = peripheralManager, peripheral.state == .poweredOn else {
+            print("[BleAdvertiser] sendDataBatch: peripheral not powered on")
+            return false
+        }
+
+        // 检查是否有已连接的中心设备
+        if connectedCentrals.isEmpty {
+            print("[BleAdvertiser] sendDataBatch: no connected centrals")
+            return false
+        }
+
+        let queueSizeBefore = pendingDataQueue.count
+        for packet in packets {
+            enqueueSegmentedData(packet)
+        }
+        print("[BleAdvertiser] sendDataBatch: added \(packets.count) packets as \(pendingDataQueue.count - queueSizeBefore) fragments, queue size: \(pendingDataQueue.count)")
+
+        // 立即开始发送
+        flushPendingDataQueueFast()
+
+        return true
+    }
+
+    /// 快速发送队列中的数据（优化版本，减少延迟）
+    private func flushPendingDataQueueFast() {
+        guard let txChar = txCharacteristic,
+              let peripheral = peripheralManager,
+              peripheral.state == .poweredOn else {
+            return
+        }
+
+        // 检查是否有订阅者
+        let subscribers = txChar.subscribedCentrals
+        guard let targetCentrals = subscribers, !targetCentrals.isEmpty else {
+            print("[BleAdvertiser] flushPendingDataQueueFast: no subscribers")
+            return
+        }
+
+        var sentCount = 0
+        var consecutiveFailures = 0
+        let maxConsecutiveFailures = 8
+
+        // 快速发送循环，最小化延迟
+        while !pendingDataQueue.isEmpty && consecutiveFailures < maxConsecutiveFailures {
             let data = pendingDataQueue.removeFirst()
-            if !sendDataToCentrals(data) {
-                // 发送队列满了，停止发送（数据会继续在队列中）
-                print("[BleAdvertiser] flushPendingDataQueue: send failed, stopping flush")
+
+            // 直接发送，不检查数据大小（应用层已分块）
+            let didSend = peripheral.updateValue(data, for: txChar, onSubscribedCentrals: targetCentrals)
+
+            if !didSend {
+                // 队列已满，放回并等待回调
+                pendingDataQueue.insert(data, at: 0)
+                consecutiveFailures += 1
+
+                if consecutiveFailures >= maxConsecutiveFailures {
+                    // 等待 peripheralManagerIsReady 回调再继续
+                    break
+                }
+
+                // 极短暂让出时间片，但不 sleep
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.0001))
+            } else {
+                consecutiveFailures = 0
+                sentCount += 1
+
+                // 每 40 个包让出一次时间片，减少调度开销
+                if sentCount % 40 == 0 {
+                    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.0001))
+                }
+            }
+
+            // 单次批量发送上限（避免阻塞太久）
+            if sentCount >= 200 {
+                // 还有数据未发送，但先让出时间片
+                if !pendingDataQueue.isEmpty {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.flushPendingDataQueueFast()
+                    }
+                }
                 break
             }
+        }
+
+        // 高频打印已禁用以提升性能
+        // print("[BleAdvertiser] flushPendingDataQueueFast: sent=\(sentCount), remaining=\(pendingDataQueue.count)")
+    }
+
+    /// 发送队列中的所有待处理数据（兼容旧版本）
+    private func flushPendingDataQueue() {
+        flushPendingDataQueueFast()
+    }
+
+    /// CoreBluetooth 的 `maximumUpdateValueLength` 已经是单次 updateValue 的安全上限。
+    private func maxOutgoingFragmentSize() -> Int {
+        let centralLimit = connectedCentrals.map { $0.maximumUpdateValueLength }.min() ?? negotiatedMtu
+        let safeLimit = centralLimit > 0 ? centralLimit : negotiatedMtu
+        return max(20, safeLimit)
+    }
+
+    /// 将 NearLink 包切成 ATT 可承载的多个片段，供 Android 端在 Flutter 层重组。
+    private func enqueueSegmentedData(_ data: Data) {
+        let fragmentSize = maxOutgoingFragmentSize()
+
+        if data.count <= fragmentSize {
+            pendingDataQueue.append(data)
+            return
+        }
+
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + fragmentSize, data.count)
+            pendingDataQueue.append(data.subdata(in: offset..<end))
+            offset = end
         }
     }
     
@@ -346,16 +504,26 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager, didDisconnectCentral central: CBCentral, error: Error?) {
         // 完全断开连接时调用（iOS 11+）
         print("[BleAdvertiser] 中心设备完全断开: \(central.identifier.uuidString), error: \(error?.localizedDescription ?? "none")")
-        
+
         // 移除断开的设备
         connectedCentrals.removeAll { $0.identifier == central.identifier }
-        
+
+        // 清理缓冲区，避免影响下次传输
+        if !reassemblyBuffer.isEmpty {
+            print("[BleAdvertiser] 清理重组缓冲区 (\(reassemblyBuffer.count) bytes)")
+            reassemblyBuffer = Data()
+        }
+        if !pendingDataQueue.isEmpty {
+            print("[BleAdvertiser] 清理发送队列 (\(pendingDataQueue.count) items)")
+            pendingDataQueue.removeAll()
+        }
+
         // 通知 Flutter 设备断开
         let eventData: [String: Any] = [
             "event": "centralDisconnected",
             "centralId": central.identifier.uuidString
         ]
-        eventSink?(eventData)
+        emitEvent(eventData)
         
         // 如果仍然有其他连接的设备，不需要重新广播
         if !connectedCentrals.isEmpty {
@@ -378,41 +546,37 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
             print("[BleAdvertiser] sendDataToCentrals: txCharacteristic is nil")
             return false
         }
-        
+
+        // 检查蓝牙是否开启
+        guard let peripheral = peripheralManager, peripheral.state == .poweredOn else {
+            print("[BleAdvertiser] sendDataToCentrals: peripheralManager not powered on, state=\(peripheralManager?.state.rawValue ?? -1)")
+            enqueueSegmentedData(data)
+            return false
+        }
+
         // 检查是否有已连接的中心设备
         if connectedCentrals.isEmpty {
             print("[BleAdvertiser] sendDataToCentrals: no connected centrals, queueing data")
-            pendingDataQueue.append(data)
+            enqueueSegmentedData(data)
             return false
         }
-        
+
+        // 检查是否有订阅者
         let subscribers = txChar.subscribedCentrals
+        print("[BleAdvertiser] sendDataToCentrals: connectedCentrals=\(connectedCentrals.count), subscribers=\(subscribers?.count ?? 0)")
+
         if subscribers == nil || subscribers!.isEmpty {
             print("[BleAdvertiser] sendDataToCentrals: no subscribers to TX char, queueing data")
-            pendingDataQueue.append(data)
+            enqueueSegmentedData(data)
             // 即使没有订阅者，也返回 true 表示数据已入队
             // 数据会在 Android 订阅后通过 didSubscribeTo -> flushPendingDataQueue 发送
             return true
         }
-        
-        // 检查蓝牙是否开启
-        if peripheralManager?.state != .poweredOn {
-            print("[BleAdvertiser] sendDataToCentrals: not powered on, queueing data")
-            pendingDataQueue.append(data)
-            return false
-        }
-        
-        // 发送给所有订阅了该特征值的中心设备
-        // CoreBluetooth 会自动处理分块
-        let didSend = peripheralManager?.updateValue(data, for: txChar, onSubscribedCentrals: nil) ?? false
-        
-        if !didSend {
-            print("[BleAdvertiser] sendDataToCentrals: updateValue returned false, queueing data")
-            pendingDataQueue.append(data)
-            // 返回 true 表示数据已入队，等待 peripheralManagerIsReady 发送
-            return true
-        }
-        
+
+        enqueueSegmentedData(data)
+        flushPendingDataQueueFast()
+
+        print("[BleAdvertiser] sendDataToCentrals: queued \(data.count) bytes as fragments, queue size = \(pendingDataQueue.count)")
         return true
     }
     
@@ -428,8 +592,35 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
         // 发送队列中的所有待处理数据
-        print("[BleAdvertiser] peripheralManagerIsReady: ready to send more data")
+        print("[BleAdvertiser] peripheralManagerIsReady: ready to send more data, queue size = \(pendingDataQueue.count)")
+
+        // 检查蓝牙状态
+        if peripheral.state != .poweredOn {
+            print("[BleAdvertiser] peripheralManagerIsReady: peripheral not powered on, state=\(peripheral.state.rawValue)")
+            return
+        }
+
+        // 检查是否有订阅者
+        guard let txChar = txCharacteristic else {
+            print("[BleAdvertiser] peripheralManagerIsReady: txCharacteristic is nil")
+            return
+        }
+
+        let subscribers = txChar.subscribedCentrals
+        print("[BleAdvertiser] peripheralManagerIsReady: subscribers count = \(subscribers?.count ?? 0)")
+
+        if subscribers == nil || subscribers!.isEmpty {
+            print("[BleAdvertiser] peripheralManagerIsReady: no subscribers, cannot send data")
+            return
+        }
+
         flushPendingDataQueue()
+        print("[BleAdvertiser] peripheralManagerIsReady: after flush, queue size = \(pendingDataQueue.count)")
+
+        // 如果队列还有数据，继续等待下一次回调
+        if !pendingDataQueue.isEmpty {
+            print("[BleAdvertiser] peripheralManagerIsReady: queue still has data, waiting for next callback")
+        }
     }
     
     // MARK: - Helper
@@ -451,6 +642,10 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
 
 extension BleAdvertiser: FlutterStreamHandler {
     func setupMethodChannel(with controller: FlutterViewController) {
+        if channelsConfigured {
+            return
+        }
+
         // Method Channel - 用于接收 Flutter 的命令
         let channel = FlutterMethodChannel(
             name: "com.nearlink/ble_advertise",
@@ -476,12 +671,27 @@ extension BleAdvertiser: FlutterStreamHandler {
             case "stopAdvertising":
                 self.stopAdvertising()
                 result(true)
+
+            case "disconnect":
+                self.disconnect()
+                result(true)
                 
             case "sendData":
                 // 发送数据到连接的中心设备
                 if let args = call.arguments as? [String: Any],
                    let data = args["data"] as? FlutterStandardTypedData {
                     let success = self.sendDataToCentrals(data.data)
+                    result(success)
+                } else {
+                    result(false)
+                }
+
+            case "sendDataBatch":
+                // 批量发送数据（高性能版本）
+                if let args = call.arguments as? [String: Any],
+                   let packetsData = args["packets"] as? [[UInt8]] {
+                    let packets = packetsData.map { Data($0) }
+                    let success = self.sendDataBatch(packets)
                     result(success)
                 } else {
                     result(false)
@@ -501,24 +711,31 @@ extension BleAdvertiser: FlutterStreamHandler {
             binaryMessenger: controller.binaryMessenger
         )
         eventChannel?.setStreamHandler(self)
+        channelsConfigured = true
     }
     
     // MARK: - FlutterStreamHandler
     
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        print("[BleAdvertiser] onListen: eventSink setup")
         self.eventSink = events
-        
-        // 如果队列中有数据，立即发送
-        if !pendingDataQueue.isEmpty {
-            while !pendingDataQueue.isEmpty {
-                let data = pendingDataQueue.removeFirst()
-                let eventData: [String: Any] = [
-                    "event": "dataReceived",
-                    "characteristicUuid": rxCharacteristic?.uuid.uuidString ?? "unknown",
-                    "data": data
-                ]
-                events(eventData)
+        print("[BleAdvertiser] onListen: eventSink ready")
+
+        if pendingEvents.first(where: { ($0["event"] as? String) == "centralConnected" }) == nil {
+            for central in connectedCentrals {
+                events([
+                    "event": "centralConnected",
+                    "centralId": central.identifier.uuidString,
+                    "mtu": central.maximumUpdateValueLength
+                ])
             }
+        }
+
+        if !pendingEvents.isEmpty {
+            for event in pendingEvents {
+                events(event)
+            }
+            pendingEvents.removeAll()
         }
         
         return nil

@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import '../models/nearlink_models.dart';
+import '../utils/extensions.dart';
 
 /// NearLink 品牌色
 class NearLinkColors {
@@ -106,7 +107,7 @@ class _BluetoothSearchingAnimationState
             child: CustomPaint(
               size: Size(widget.size * 1.5, widget.size * 1.5),
               painter: _BluetoothWavePainter(
-                color: widget.color.withAlpha((0.3 * 255).toInt()),
+                color: widget.color.o(0.3),
               ),
             ),
           ),
@@ -122,7 +123,7 @@ class _BluetoothSearchingAnimationState
               width: widget.size,
               height: widget.size,
               decoration: BoxDecoration(
-                color: widget.color.withAlpha((0.1 * 255).toInt()),
+                color: widget.color.o(0.1),
                 shape: BoxShape.circle,
               ),
             ),
@@ -150,7 +151,7 @@ class _BluetoothWavePainter extends CustomPainter {
 
     for (int i = 0; i < 3; i++) {
       final paint = Paint()
-        ..color = color.withAlpha(((0.3 - i * 0.1) * 255).toInt())
+        ..color = color.o(0.3 - i * 0.1)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 3;
 
@@ -281,10 +282,10 @@ class DeviceCard extends StatelessWidget {
         side: isConnected
             ? const BorderSide(color: NearLinkColors.success, width: 2)
             : isNearLinkDevice
-                ? BorderSide(color: NearLinkColors.primary.withAlpha((0.5 * 255).toInt()), width: 1)
+                ? BorderSide(color: NearLinkColors.primary.o(0.5), width: 1)
                 : BorderSide.none,
       ),
-      color: isNearLinkDevice ? NearLinkColors.primary.withAlpha((0.05 * 255).toInt()) : null,
+      color: isNearLinkDevice ? NearLinkColors.primary.o(0.05) : null,
       child: InkWell(
         onTap: onTap,
         onLongPress: onLongPress,
@@ -298,9 +299,9 @@ class DeviceCard extends StatelessWidget {
                 width: 50,
                 height: 50,
                 decoration: BoxDecoration(
-                  color: isNearLinkDevice 
-                      ? NearLinkColors.primary.withAlpha((0.15 * 255).toInt())
-                      : NearLinkColors.primary.withAlpha((0.08 * 255).toInt()),
+                  color: isNearLinkDevice
+                      ? NearLinkColors.primary.o(0.15)
+                      : NearLinkColors.primary.o(0.08),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(
@@ -466,7 +467,7 @@ class TransferProgressBar extends StatelessWidget {
           child: LinearProgressIndicator(
             value: progress,
             minHeight: 8,
-            backgroundColor: NearLinkColors.primary.withAlpha((0.2 * 255).toInt()),
+            backgroundColor: NearLinkColors.primary.o(0.2),
             valueColor: AlwaysStoppedAnimation<Color>(
               color ?? NearLinkColors.primary,
             ),
@@ -503,7 +504,7 @@ class EmptyState extends StatelessWidget {
             Icon(
               icon,
               size: 80,
-              color: NearLinkColors.textSecondary.withAlpha((0.5 * 255).toInt()),
+              color: NearLinkColors.textSecondary.o(0.5),
             ),
             const SizedBox(height: 16),
             Text(

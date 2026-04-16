@@ -7,6 +7,7 @@ import '../providers/nearlink_provider.dart';
 import '../models/nearlink_models.dart';
 import '../widgets/nearlink_widgets.dart';
 import '../bluetooth/nearlink_bluetooth_service.dart';
+import '../utils/extensions.dart';
 import 'transfer_screen.dart';
 
 /// 设备发现页面
@@ -203,7 +204,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           width: 100,
           height: 100,
           decoration: BoxDecoration(
-            color: NearLinkColors.success.withAlpha((0.1 * 255).toInt()),
+            color: NearLinkColors.success.o(0.1),
             shape: BoxShape.circle,
           ),
           child: const Icon(
@@ -235,7 +236,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
-            color: NearLinkColors.primary.withAlpha((0.1 * 255).toInt()),
+            color: NearLinkColors.primary.o(0.1),
             borderRadius: BorderRadius.circular(16),
           ),
           child: const Row(
@@ -264,7 +265,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           width: 100,
           height: 100,
           decoration: BoxDecoration(
-            color: NearLinkColors.primary.withAlpha((0.1 * 255).toInt()),
+            color: NearLinkColors.primary.o(0.1),
             shape: BoxShape.circle,
           ),
           child: const Icon(
@@ -301,7 +302,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           width: 100,
           height: 100,
           decoration: BoxDecoration(
-            color: NearLinkColors.success.withAlpha((0.1 * 255).toInt()),
+            color: NearLinkColors.success.o(0.1),
             shape: BoxShape.circle,
           ),
           child: const Icon(
@@ -447,7 +448,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         border: Border(
-          top: BorderSide(color: Colors.grey.withAlpha((0.2 * 255).toInt())),
+          top: BorderSide(color: Colors.grey.o(0.2)),
         ),
       ),
       child: Row(
@@ -463,7 +464,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                     _showOnlyPhones = value;
                   });
                 },
-                activeTrackColor: NearLinkColors.primary.withAlpha((0.5 * 255).toInt()),
+                activeTrackColor: NearLinkColors.primary.o(0.5),
                 thumbColor: WidgetStateProperty.resolveWith((states) {
                   if (states.contains(WidgetState.selected)) {
                     return NearLinkColors.primary;
@@ -503,7 +504,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                   width: 56,
                   height: 56,
                   decoration: BoxDecoration(
-                    color: NearLinkColors.primary.withAlpha((0.1 * 255).toInt()),
+                    color: NearLinkColors.primary.o(0.1),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: const Icon(Icons.info_outline, color: NearLinkColors.primary),
@@ -594,14 +595,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             ),
             const SizedBox(width: 12),
             IconButton(
-              onPressed: () {
-                if (provider.isPeripheralConnected) {
-                  // iOS 作为 Peripheral 被连接，需要特殊处理断开
-                  _showDisconnectPeripheralDialog(context, provider);
-                } else {
-                  provider.disconnect();
-                }
-              },
+              onPressed: () => _showDisconnectPeripheralDialog(context, provider),
               icon: const Icon(Icons.link_off),
               tooltip: '断开连接',
             ),
@@ -622,7 +616,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                 child: ElevatedButton.icon(
                   onPressed: provider.connectionState == NearLinkConnectionState.scanning
                       ? () => provider.stopScan()
-                      : () => provider.startScan(),
+                      : () async {
+                          final hasPermission = await provider.checkAndRequestPermissions(context);
+                          if (hasPermission) {
+                            provider.startScan();
+                          }
+                        },
                   icon: Icon(
                     provider.connectionState == NearLinkConnectionState.scanning
                         ? Icons.stop
@@ -728,6 +727,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
 
   /// 切换广播状态
   Future<void> _toggleAdvertising(NearLinkProvider provider) async {
+    // 只有在开启广播时才需要检查权限
+    if (!provider.isAdvertising) {
+      final hasPermission = await provider.checkAndRequestPermissions(context);
+      if (!hasPermission) return;
+    }
+
     try {
       await provider.toggleAdvertising();
       
@@ -948,7 +953,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: NearLinkColors.primary.withAlpha((0.08 * 255).toInt()),
+                color: NearLinkColors.primary.o(0.08),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: const Column(
@@ -1004,24 +1009,23 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  /// 显示断开 Peripheral 连接的确认对话框（iOS 作为 Peripheral 被连接时）
+  /// 显示断开连接的确认对话框
   void _showDisconnectPeripheralDialog(BuildContext context, NearLinkProvider provider) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('断开连接'),
-        content: const Text('断开连接后，对方将无法再接收文件。是否继续？'),
+        content: const Text('断开连接后，需要重新搜索并建立连接。是否继续？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('取消'),
           ),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               Navigator.pop(context);
-              // iOS 作为 Peripheral 被连接时，只能通过停止广播来断开（实际上已经停止了）
-              // 这里主要是重置 UI 状态，真正的断开由 iOS 原生层处理
-              provider.stopAdvertising();  // 确保广播停止
+              await provider.disconnect();
+              if (!context.mounted) return;
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('已断开连接')),
               );

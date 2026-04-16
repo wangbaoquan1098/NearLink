@@ -1,4 +1,7 @@
+import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 /// 权限服务
@@ -9,36 +12,85 @@ class PermissionService {
 
   /// 请求蓝牙权限
   Future<bool> requestBluetoothPermissions() async {
-    final permissions = [
-      Permission.bluetooth,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.bluetoothAdvertise,  // Android 12+ 广播需要
-      Permission.location,
-      Permission.locationWhenInUse,
-    ];
-
-    final results = <PermissionStatus>[];
-
-    for (final permission in permissions) {
-      final status = await permission.status;
-      if (status.isDenied) {
-        results.add(await permission.request());
-      } else {
-        results.add(status);
-      }
+    // iOS：使用蓝牙会触发系统权限弹窗，不需要手动请求
+    // 只需要检查状态是否是 unauthorized
+    if (Platform.isIOS) {
+      final adapterState = await FlutterBluePlus.adapterState.first;
+      debugPrint('[PermissionService] iOS adapterState: $adapterState');
+      // unauthorized 表示权限被拒绝，其他状态都表示有权限（系统已授权或不需要授权）
+      return adapterState != BluetoothAdapterState.unauthorized;
     }
 
-    return results.every((status) =>
+    // Android 使用细分的蓝牙权限
+    final permissions = <Permission>[];
+
+    final scanStatus = await Permission.bluetoothScan.status;
+    final connectStatus = await Permission.bluetoothConnect.status;
+    final advertiseStatus = await Permission.bluetoothAdvertise.status;
+
+    debugPrint('[PermissionService] Android请求前状态 - scan: ${scanStatus.name}, connect: ${connectStatus.name}, advertise: ${advertiseStatus.name}');
+
+    if (scanStatus.isDenied) {
+      permissions.add(Permission.bluetoothScan);
+    }
+    if (connectStatus.isDenied) {
+      permissions.add(Permission.bluetoothConnect);
+    }
+    if (advertiseStatus.isDenied) {
+      permissions.add(Permission.bluetoothAdvertise);
+    }
+
+    // 位置权限（Android 需要）
+    if (await Permission.locationWhenInUse.status.isDenied) {
+      permissions.add(Permission.locationWhenInUse);
+    }
+
+    debugPrint('[PermissionService] 需要请求的权限: $permissions');
+
+    if (permissions.isEmpty) {
+      return true;
+    }
+
+    final results = await permissions.request();
+    debugPrint('[PermissionService] 请求结果: $results');
+
+    return results.values.every((status) =>
         status.isGranted || status.isLimited);
   }
 
   /// 检查蓝牙权限
   Future<bool> hasBluetoothPermissions() async {
-    final bluetooth = await Permission.bluetooth.status;
+    // iOS 使用 flutter_blue_plus 的蓝牙状态来检查权限
+    if (Platform.isIOS) {
+      final adapterState = await FlutterBluePlus.adapterState.first;
+      debugPrint('[PermissionService] iOS adapterState: $adapterState');
+      // unauthorized 表示没有权限，其他状态（on/off）都表示有权限
+      return adapterState != BluetoothAdapterState.unauthorized;
+    }
+
+    // Android 使用细分的蓝牙权限
+    final bluetoothScan = await Permission.bluetoothScan.status;
+    final bluetoothConnect = await Permission.bluetoothConnect.status;
     final location = await Permission.locationWhenInUse.status;
 
-    return bluetooth.isGranted && location.isGranted;
+    debugPrint('[PermissionService] Android bluetoothScan: ${bluetoothScan.name}, bluetoothConnect: ${bluetoothConnect.name}, location: ${location.name}');
+
+    return bluetoothScan.isGranted &&
+        bluetoothConnect.isGranted &&
+        location.isGranted;
+  }
+
+  /// 检查权限是否被永久拒绝
+  Future<bool> isBluetoothPermissionPermanentlyDenied() async {
+    if (Platform.isIOS) {
+      // iOS 上使用蓝牙会触发权限弹窗，如果用户拒绝则状态是 unauthorized
+      final adapterState = await FlutterBluePlus.adapterState.first;
+      return adapterState == BluetoothAdapterState.unauthorized;
+    }
+
+    final bluetoothScan = await Permission.bluetoothScan.status;
+    final bluetoothConnect = await Permission.bluetoothConnect.status;
+    return bluetoothScan.isPermanentlyDenied || bluetoothConnect.isPermanentlyDenied;
   }
 
   /// 请求存储权限
@@ -120,7 +172,7 @@ extension PermissionExtension on AppPermission {
       case AppPermission.bluetooth:
         return '用于发现并连接附近设备';
       case AppPermission.location:
-        return '蓝牙扫描需要位置权限（Android 系统要求）';
+        return '蓝牙扫描需要位置权限（仅 Android 系统要求）';
       case AppPermission.storage:
         return '用于访问和保存文件';
       case AppPermission.notification:

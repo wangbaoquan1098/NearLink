@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import '../bluetooth/nearlink_bluetooth_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../bluetooth/nearlink_bluetooth_service.dart';
 import '../models/nearlink_models.dart';
@@ -10,6 +12,7 @@ import '../services/file_transfer_service.dart';
 import '../platforms/android/nfc_dispatcher.dart';
 import '../platforms/ios/ios_platform_adapter.dart';
 import '../services/permission_service.dart';
+import '../widgets/nearlink_widgets.dart';
 
 /// 连接成功事件
 class ConnectionSuccessEvent {
@@ -62,6 +65,7 @@ class NearLinkProvider extends ChangeNotifier {
 
   // 状态
   bool _isInitialized = false;
+  bool _isInitializing = false;  // 防止重复初始化
   bool _isDarkMode = false;
   String? _currentDeviceName;
   String? _selectedFilePath;
@@ -143,7 +147,9 @@ class NearLinkProvider extends ChangeNotifier {
 
   /// 初始化
   Future<void> initialize() async {
-    if (_isInitialized) return;
+    // 防止重复初始化或并发初始化
+    if (_isInitialized || _isInitializing) return;
+    _isInitializing = true;
 
     _currentDeviceName = 'NearLink-${DateTime.now().millisecondsSinceEpoch % 10000}';
 
@@ -180,15 +186,192 @@ class NearLinkProvider extends ChangeNotifier {
       );
     }
 
-    // 请求必要权限
-    await _permissionService.requestBluetoothPermissions();
-
     _isInitialized = true;
+    _isInitializing = false;
     notifyListeners();
+  }
+
+  /// 检查并请求权限（在需要时调用，如点击扫描按钮）
+  /// 返回 true 表示权限已获取，可以继续操作
+  Future<bool> checkAndRequestPermissions(BuildContext context) async {
+    debugPrint('[NearLinkProvider] 检查权限，平台: ${Platform.operatingSystem}');
+
+    // 先检查蓝牙是否开启
+    final adapterState = await FlutterBluePlus.adapterState.first;
+    if (adapterState != BluetoothAdapterState.on) {
+      if (context.mounted) {
+        _showBluetoothOffDialog(context);
+      }
+      return false;
+    }
+
+    final hasPermissions = await _permissionService.hasBluetoothPermissions();
+    debugPrint('[NearLinkProvider] 权限检查结果: $hasPermissions');
+    if (hasPermissions) {
+      return true;
+    }
+
+    // 检查是否被永久拒绝
+    final isPermanentlyDenied = await _permissionService.isBluetoothPermissionPermanentlyDenied();
+    debugPrint('[NearLinkProvider] 是否永久拒绝: $isPermanentlyDenied');
+    if (isPermanentlyDenied && context.mounted) {
+      // 权限被永久拒绝，直接引导去设置
+      _showPermissionDeniedDialog(context);
+      return false;
+    }
+
+    // 显示权限说明对话框
+    final shouldRequest = await _showPermissionExplanationDialog(context);
+    if (!shouldRequest) {
+      return false;
+    }
+
+    // 请求权限
+    final granted = await _permissionService.requestBluetoothPermissions();
+    debugPrint('[NearLinkProvider] 权限请求结果: $granted');
+    if (!granted && context.mounted) {
+      // 权限被拒绝，提示用户
+      _showPermissionDeniedDialog(context);
+    }
+    return granted;
+  }
+
+  /// 显示蓝牙未开启对话框
+  void _showBluetoothOffDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.bluetooth_disabled, color: NearLinkColors.error),
+            const SizedBox(width: 8),
+            const Text('蓝牙未开启'),
+          ],
+        ),
+        content: const Text('请在系统设置中开启蓝牙后重试。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 显示权限说明对话框
+  Future<bool> _showPermissionExplanationDialog(BuildContext context) async {
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.bluetooth, color: NearLinkColors.primary),
+            SizedBox(width: 8),
+            Text('需要蓝牙权限'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('NearLink 需要以下权限来发现和连接附近设备：'),
+            SizedBox(height: 12),
+            _PermissionItem(icon: Icons.bluetooth, text: '蓝牙扫描和连接'),
+            if (Platform.isAndroid)
+              _PermissionItem(icon: Icons.location_on, text: '位置信息（系统要求用于蓝牙扫描）'),
+            SizedBox(height: 12),
+            Text(
+              '所有数据传输仅在设备间直接进行，不会上传至服务器。',
+              style: TextStyle(fontSize: 12, color: NearLinkColors.textSecondary),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: NearLinkColors.primary,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('授权'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  /// 显示权限被拒绝对话框
+  void _showPermissionDeniedDialog(BuildContext context) {
+    final isIOS = Platform.isIOS;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.bluetooth_disabled, color: NearLinkColors.error),
+            const SizedBox(width: 8),
+            const Text('蓝牙权限被拒绝'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'NearLink 需要蓝牙权限来发现和连接附近设备。',
+            ),
+            const SizedBox(height: 12),
+            if (isIOS) ...[
+              const Text(
+                '请在设置中开启权限：',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 4),
+              const Text('设置 > 隐私与安全性 > 蓝牙 > NearLink'),
+            ] else ...[
+              const Text(
+                '请在设置中开启蓝牙和位置权限',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              _permissionService.openSettings();
+            },
+            icon: const Icon(Icons.settings),
+            label: const Text('去设置'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: NearLinkColors.primary,
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 蓝牙服务状态变化回调
   void _onBluetoothServiceChanged() {
+    if (!_bluetoothService.isConnected && !_bluetoothService.isPeripheralConnected) {
+      _connectedRemoteDevice = null;
+    }
+
     // 检测 iOS 作为 Peripheral 被连接的状态变化
     if (_bluetoothService.isPeripheralConnected && _lastIncomingDeviceName == null) {
       // iOS 被连接，触发被动连接事件
@@ -481,5 +664,30 @@ class NearLinkProvider extends ChangeNotifier {
     _bluetoothService.removeListener(_onBluetoothServiceChanged);
     _nfcDispatcher?.dispose();
     super.dispose();
+  }
+}
+
+/// 权限项组件（用于权限说明对话框）
+class _PermissionItem extends StatelessWidget {
+  final IconData icon;
+  final String text;
+
+  const _PermissionItem({
+    required this.icon,
+    required this.text,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: const Color(0xFF2196F3)),
+          const SizedBox(width: 8),
+          Text(text),
+        ],
+      ),
+    );
   }
 }

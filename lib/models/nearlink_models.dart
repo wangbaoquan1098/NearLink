@@ -11,6 +11,7 @@ enum PacketType {
   chunk,
   chunkAck,
   chunkNack,
+  batchAck,        // 批量确认：一次确认多个 chunk
   transferComplete,
   transferCompleteAck,
   cancel,
@@ -167,11 +168,11 @@ class NearLinkPacket {
 
     try {
       final type = PacketType.values[data[0]];
-      final fileId = String.fromCharCodes(data.sublist(1, 33)).trim();
+      final fileId = _decodePaddedString(data.sublist(1, 33));
       final chunkIndex = (data[33] << 8) | data[34];
       final totalChunks = (data[35] << 8) | data[36];
       final payloadSize = (data[37] << 8) | data[38];
-      final checksum = String.fromCharCodes(data.sublist(39, 47)).trim();
+      final checksum = _decodePaddedString(data.sublist(39, 47));
       final timestamp = (data[47] << 24) | (data[48] << 16) | (data[49] << 8) | data[50];
 
       if (data.length < headerSize + payloadSize) return null;
@@ -198,6 +199,11 @@ class NearLinkPacket {
     } catch (e) {
       return null;
     }
+  }
+
+  static String _decodePaddedString(List<int> bytes) {
+    final filtered = bytes.where((byte) => byte != 0).toList();
+    return String.fromCharCodes(filtered).trim();
   }
 
   /// 解码 metadata
@@ -327,8 +333,28 @@ class NearLinkPacket {
     required int totalChunks,
     required Uint8List fileChecksum,
   }) {
-    // 限制文件名为 64 字符，避免 metadata 过大导致超过 BLE MTU 限制
-    final truncatedFileName = fileName.length > 64 ? fileName.substring(0, 64) : fileName;
+    // 限制文件名为 64 字符，但优先保留扩展名
+    String truncatedFileName = fileName;
+    if (fileName.length > 64) {
+      // 查找最后一个点（扩展名分隔符）
+      final lastDot = fileName.lastIndexOf('.');
+      if (lastDot > 0 && lastDot < fileName.length - 1) {
+        // 有扩展名，优先保留扩展名
+        final extension = fileName.substring(lastDot);
+        final nameWithoutExt = fileName.substring(0, lastDot);
+        // 计算保留扩展名后，主文件名最多能保留多少字符
+        final maxNameLength = 64 - extension.length;
+        if (maxNameLength > 0) {
+          truncatedFileName = nameWithoutExt.substring(0, maxNameLength) + extension;
+        } else {
+          // 扩展名太长，只能截断到 64 字符
+          truncatedFileName = fileName.substring(0, 64);
+        }
+      } else {
+        // 没有扩展名，直接截断
+        truncatedFileName = fileName.substring(0, 64);
+      }
+    }
     // 限制 mimeType 为 32 字符
     final truncatedMimeType = mimeType.length > 32 ? mimeType.substring(0, 32) : mimeType;
     
@@ -391,6 +417,48 @@ class NearLinkPacket {
     );
   }
 
+  /// 创建批量确认包
+  /// [lastChunkIndex] - 最后一个成功接收的 chunk 索引
+  /// [receivedChunks] - 可选：位图表示哪些 chunk 已收到（用于选择性确认）
+  factory NearLinkPacket.batchAck({
+    required String fileId,
+    required int lastChunkIndex,
+    List<int>? receivedChunks,
+  }) {
+    // 编码：4字节 lastChunkIndex + 可选的位图
+    final payload = BytesBuilder();
+    // lastChunkIndex (4 bytes, big endian)
+    payload.add([
+      (lastChunkIndex >> 24) & 0xFF,
+      (lastChunkIndex >> 16) & 0xFF,
+      (lastChunkIndex >> 8) & 0xFF,
+      lastChunkIndex & 0xFF,
+    ]);
+    // 如果有位图，添加位图
+    if (receivedChunks != null && receivedChunks.isNotEmpty) {
+      // 位图长度 (2 bytes)
+      final bitmapLength = receivedChunks.length;
+      payload.add([
+        (bitmapLength >> 8) & 0xFF,
+        bitmapLength & 0xFF,
+      ]);
+      // 位图数据
+      payload.add(receivedChunks);
+    }
+    final payloadBytes = payload.toBytes();
+
+    return NearLinkPacket(
+      type: PacketType.batchAck,
+      fileId: fileId,
+      chunkIndex: lastChunkIndex,
+      totalChunks: 0,
+      payloadSize: payloadBytes.length,
+      checksum: _calculateChecksum(Uint8List.fromList(payloadBytes)),
+      payload: Uint8List.fromList(payloadBytes),
+      timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
+
   /// 创建传输完成包
   factory NearLinkPacket.transferComplete({
     required String fileId,
@@ -424,6 +492,34 @@ class NearLinkPacket {
     );
   }
 
+  factory NearLinkPacket.ping() {
+    final payload = Uint8List.fromList('PING'.codeUnits);
+    return NearLinkPacket(
+      type: PacketType.ping,
+      fileId: '',
+      chunkIndex: 0,
+      totalChunks: 0,
+      payloadSize: payload.length,
+      checksum: _calculateChecksum(payload),
+      payload: payload,
+      timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
+
+  factory NearLinkPacket.pong() {
+    final payload = Uint8List.fromList('PONG'.codeUnits);
+    return NearLinkPacket(
+      type: PacketType.pong,
+      fileId: '',
+      chunkIndex: 0,
+      totalChunks: 0,
+      payloadSize: payload.length,
+      checksum: _calculateChecksum(payload),
+      payload: payload,
+      timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+  }
+
   static List<int> _encodeMetadata(Map<String, dynamic> metadata) {
     final result = <int>[];
     for (final entry in metadata.entries) {
@@ -436,8 +532,9 @@ class NearLinkPacket {
         result.addAll(_intToBytes(value));
       } else if (value is String) {
         result.add(2); // string type
-        result.add(value.length);
-        result.addAll(value.codeUnits);
+        final bytes = value.codeUnits;
+        result.add(bytes.length);
+        result.addAll(bytes);
       } else if (value is Uint8List) {
         result.add(3); // bytes type
         result.add(value.length);

@@ -41,7 +41,7 @@ class IosPlatformAdapter {
         bluetoothConnectStatus.isGranted;
   }
 
-  /// 检查位置权限（iOS BLE 扫描需要）
+  /// 检查位置权限（iOS BLE 扫描不需要，仅在使用 iBeacon 时需要）
   Future<bool> checkLocationPermission() async {
     if (!isIOS) return true;
 
@@ -78,8 +78,7 @@ iOS 蓝牙使用说明：
 1. 蓝牙传输需要 App 在前台运行
 2. 按 Home 键或切换 App 可能中断传输
 3. 大文件（> 50MB）建议使用系统 AirDrop
-4. 首次使用需要授权蓝牙和位置权限
-5. 位置权限仅用于蓝牙设备发现，不会收集位置信息
+4. 首次使用需要授权蓝牙权限
 
 如需传输大文件，请点击右上角分享按钮使用 AirDrop。
 ''';
