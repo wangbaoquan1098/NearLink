@@ -111,6 +111,35 @@ class MainActivity : FlutterActivity() {
                         result.success(false)
                     }
                 }
+                "sendDataBatch" -> {
+                    val rawPackets = call.argument<List<Any>>("packets")
+                    val packets = rawPackets?.mapNotNull { item ->
+                        when (item) {
+                            is ByteArray -> item
+                            is List<*> -> {
+                                val byteValues = item.mapNotNull { value ->
+                                    (value as? Number)?.toInt()
+                                }
+                                if (byteValues.size != item.size) {
+                                    null
+                                } else {
+                                    ByteArray(byteValues.size) { index ->
+                                        byteValues[index].toByte()
+                                    }
+                                }
+                            }
+                            else -> null
+                        }
+                    }
+
+                    if (packets != null && connectedDevice != null) {
+                        val success =
+                            gattServer?.sendDataBatch(connectedDevice!!, packets) ?: false
+                        result.success(success)
+                    } else {
+                        result.success(false)
+                    }
+                }
                 "getPendingNotificationCount" -> {
                     val pendingCount = if (connectedDevice != null) {
                         gattServer?.getPendingNotificationCount(connectedDevice!!) ?: 0

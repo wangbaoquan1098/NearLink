@@ -391,7 +391,7 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         for packet in packets {
             enqueueSegmentedData(packet)
         }
-        print("[BleAdvertiser] sendDataBatch: added \(packets.count) packets as \(pendingDataQueue.count - queueSizeBefore) fragments, queue size: \(pendingDataQueue.count)")
+        // print("[BleAdvertiser] sendDataBatch: added \(packets.count) packets as \(pendingDataQueue.count - queueSizeBefore) fragments, queue size: \(pendingDataQueue.count)")
 
         // 立即开始发送
         flushPendingDataQueueFast()
@@ -410,7 +410,7 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         // 检查是否有订阅者
         let subscribers = txChar.subscribedCentrals
         guard let targetCentrals = subscribers, !targetCentrals.isEmpty else {
-            print("[BleAdvertiser] flushPendingDataQueueFast: no subscribers")
+            // print("[BleAdvertiser] flushPendingDataQueueFast: no subscribers")
             return
         }
 
@@ -563,10 +563,10 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
 
         // 检查是否有订阅者
         let subscribers = txChar.subscribedCentrals
-        print("[BleAdvertiser] sendDataToCentrals: connectedCentrals=\(connectedCentrals.count), subscribers=\(subscribers?.count ?? 0)")
+        // print("[BleAdvertiser] sendDataToCentrals: connectedCentrals=\(connectedCentrals.count), subscribers=\(subscribers?.count ?? 0)")
 
         if subscribers == nil || subscribers!.isEmpty {
-            print("[BleAdvertiser] sendDataToCentrals: no subscribers to TX char, queueing data")
+            // print("[BleAdvertiser] sendDataToCentrals: no subscribers to TX char, queueing data")
             enqueueSegmentedData(data)
             // 即使没有订阅者，也返回 true 表示数据已入队
             // 数据会在 Android 订阅后通过 didSubscribeTo -> flushPendingDataQueue 发送
@@ -576,7 +576,7 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         enqueueSegmentedData(data)
         flushPendingDataQueueFast()
 
-        print("[BleAdvertiser] sendDataToCentrals: queued \(data.count) bytes as fragments, queue size = \(pendingDataQueue.count)")
+        // print("[BleAdvertiser] sendDataToCentrals: queued \(data.count) bytes as fragments, queue size = \(pendingDataQueue.count)")
         return true
     }
     
@@ -592,34 +592,34 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
         // 发送队列中的所有待处理数据
-        print("[BleAdvertiser] peripheralManagerIsReady: ready to send more data, queue size = \(pendingDataQueue.count)")
+        // print("[BleAdvertiser] peripheralManagerIsReady: ready to send more data, queue size = \(pendingDataQueue.count)")
 
         // 检查蓝牙状态
         if peripheral.state != .poweredOn {
-            print("[BleAdvertiser] peripheralManagerIsReady: peripheral not powered on, state=\(peripheral.state.rawValue)")
+            // print("[BleAdvertiser] peripheralManagerIsReady: peripheral not powered on, state=\(peripheral.state.rawValue)")
             return
         }
 
         // 检查是否有订阅者
         guard let txChar = txCharacteristic else {
-            print("[BleAdvertiser] peripheralManagerIsReady: txCharacteristic is nil")
+            // print("[BleAdvertiser] peripheralManagerIsReady: txCharacteristic is nil")
             return
         }
 
         let subscribers = txChar.subscribedCentrals
-        print("[BleAdvertiser] peripheralManagerIsReady: subscribers count = \(subscribers?.count ?? 0)")
+        // print("[BleAdvertiser] peripheralManagerIsReady: subscribers count = \(subscribers?.count ?? 0)")
 
         if subscribers == nil || subscribers!.isEmpty {
-            print("[BleAdvertiser] peripheralManagerIsReady: no subscribers, cannot send data")
+            // print("[BleAdvertiser] peripheralManagerIsReady: no subscribers, cannot send data")
             return
         }
 
         flushPendingDataQueue()
-        print("[BleAdvertiser] peripheralManagerIsReady: after flush, queue size = \(pendingDataQueue.count)")
+        // print("[BleAdvertiser] peripheralManagerIsReady: after flush, queue size = \(pendingDataQueue.count)")
 
         // 如果队列还有数据，继续等待下一次回调
         if !pendingDataQueue.isEmpty {
-            print("[BleAdvertiser] peripheralManagerIsReady: queue still has data, waiting for next callback")
+            // print("[BleAdvertiser] peripheralManagerIsReady: queue still has data, waiting for next callback")
         }
     }
     

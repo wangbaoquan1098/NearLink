@@ -1050,14 +1050,19 @@ class NearLinkBluetoothService extends ChangeNotifier {
     }
 
     try {
-      // 检查特征值是否支持不带响应写入
-      final bool canWriteWithoutResponse =
-          _rxCharacteristic!.properties.writeWithoutResponse;
-
       // Android 向 iOS 发送时，使用更小的分块大小
       // iOS BLE MTU 最大为 185，减去 3 字节 ATT 头，实际可用约 182
       // 为了安全，使用 180 字节
       final bool isTargetIOS = _connectedDeviceIsIOSPeer;
+
+      // 检查特征值是否支持不带响应写入
+      final bool canWriteWithoutResponse =
+          _rxCharacteristic!.properties.writeWithoutResponse;
+      final int writeWindowSize = canWriteWithoutResponse
+          ? (isTargetIOS ? 4 : 8)
+          : 1;
+      final pendingWrites = <Future<void>>[];
+
       final int chunkSize = isTargetIOS ? 180 : 512;
       // 高频打印已禁用以提升性能
       // debugPrint('[NearLink] sendData: chunkSize=$chunkSize, targetIOS=$isTargetIOS');
@@ -1070,8 +1075,17 @@ class NearLinkBluetoothService extends ChangeNotifier {
 
         try {
           // 根据特征值属性选择写入模式
-          await _rxCharacteristic!
-              .write(chunk, withoutResponse: canWriteWithoutResponse);
+          final writeFuture = _rxCharacteristic!.write(
+            chunk,
+            withoutResponse: canWriteWithoutResponse,
+          );
+          pendingWrites.add(writeFuture);
+
+          final shouldFlushWindow = pendingWrites.length >= writeWindowSize;
+          if (shouldFlushWindow) {
+            await Future.wait(pendingWrites, eagerError: true);
+            pendingWrites.clear();
+          }
         } catch (writeError) {
           // GATT_INVALID_HANDLE 通常表示连接已断开
           if (writeError.toString().contains('GATT_INVALID_HANDLE') ||
@@ -1087,9 +1101,16 @@ class NearLinkBluetoothService extends ChangeNotifier {
         offset = end;
 
         // 当 Android 作为 Central 向 iOS Peripheral 连续写入时，适度让出时间片，避免队列溢出。
-        if (offset < data.length && (offset ~/ chunkSize) % 10 == 9) {
+        if (offset < data.length &&
+            canWriteWithoutResponse &&
+            isTargetIOS &&
+            pendingWrites.isEmpty) {
           await Future.delayed(const Duration(milliseconds: 1));
         }
+      }
+
+      if (pendingWrites.isNotEmpty) {
+        await Future.wait(pendingWrites, eagerError: true);
       }
       return true;
     } catch (e) {

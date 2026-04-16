@@ -240,12 +240,7 @@ class BleGattServer(private val context: Context) {
 
         try {
             val queue = pendingNotifications.getOrPut(device.address) { ArrayDeque() }
-            var offset = 0
-            while (offset < data.size) {
-                val end = minOf(offset + maxNotifySize, data.size)
-                queue.addLast(data.copyOfRange(offset, end))
-                offset = end
-            }
+            enqueueNotificationFragments(queue, data, maxNotifySize)
 
             if (notificationInFlight.contains(device.address)) {
                 return true
@@ -262,9 +257,55 @@ class BleGattServer(private val context: Context) {
         }
     }
 
+    fun sendDataBatch(device: BluetoothDevice, packets: List<ByteArray>): Boolean {
+        if (!connectedDevices.contains(device)) {
+            return false
+        }
+
+        if (packets.isEmpty()) {
+            return true
+        }
+
+        val mtu = deviceMtuMap[device.address] ?: 185
+        val maxNotifySize = minOf(MAX_NOTIFY_ATTRIBUTE_VALUE, maxOf(20, mtu - 3))
+
+        try {
+            val queue = pendingNotifications.getOrPut(device.address) { ArrayDeque() }
+            for (packet in packets) {
+                enqueueNotificationFragments(queue, packet, maxNotifySize)
+            }
+
+            if (notificationInFlight.contains(device.address)) {
+                return true
+            }
+
+            val started = sendNextNotification(device)
+            if (!started) {
+                clearNotificationState(device)
+                Log.w(TAG, "批量通知发送失败: device=${device.address}, mtu=$mtu, packets=${packets.size}")
+            }
+            return started
+        } catch (e: SecurityException) {
+            return false
+        }
+    }
+
     fun getPendingNotificationCount(device: BluetoothDevice): Int {
         val queue = pendingNotifications[device.address]
         return queue?.size ?: 0
+    }
+
+    private fun enqueueNotificationFragments(
+        queue: ArrayDeque<ByteArray>,
+        data: ByteArray,
+        maxNotifySize: Int
+    ) {
+        var offset = 0
+        while (offset < data.size) {
+            val end = minOf(offset + maxNotifySize, data.size)
+            queue.addLast(data.copyOfRange(offset, end))
+            offset = end
+        }
     }
 
     private fun sendNextNotification(device: BluetoothDevice): Boolean {

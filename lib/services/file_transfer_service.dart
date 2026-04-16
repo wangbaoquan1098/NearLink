@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:path_provider/path_provider.dart';
@@ -24,11 +25,10 @@ class FileTransferService extends ChangeNotifier {
   final Map<String, Set<int>> _receivedChunks = {}; // 追踪每个文件已收到的 chunk 索引
   final Map<String, int> _lastAckChunk = {}; // 追踪每个文件最后确认的 chunk 索引（用于批量确认）
   static const int _batchAckInterval = 20; // 默认每 20 个 chunk 发送一次批量确认
-  static const int _largeChunkBatchAckInterval = 6; // 大 chunk 更频繁确认，保持双端进度更接近
-  static const int _iosSingleWritePayloadSize =
-      116; // 180B ATT 写入预算 - 64B NearLink 头
-  static const int _androidPeripheralPayloadSize =
-      NearLinkConstants.maxChunkSize * 2; // 880B，由原生通知层拆成多次发送
+  static const int _largeChunkBatchAckInterval =
+      24; // 大 chunk 降低 ACK 频率，减少反向控制流量
+  static const int _highThroughputPayloadSize =
+      NearLinkConstants.maxChunkSize * 2; // 880B，允许协议包跨多个 ATT 分片
   static const Duration _transferCompleteAckTimeout = Duration(seconds: 5);
   static const Duration _androidPeripheralTransferCompleteRetryTimeout =
       Duration(seconds: 15);
@@ -75,17 +75,19 @@ class FileTransferService extends ChangeNotifier {
     int chunkSize;
     if (isPeripheralMode && Platform.isIOS) {
       final centralMtu = _bluetoothService.connectedCentralMtu;
-      final canUseLargePacket = centralMtu != null &&
+      final canUseHighThroughputPayload = centralMtu != null &&
           centralMtu >=
               NearLinkConstants.maxChunkSize + NearLinkConstants.headerSize;
-      chunkSize = canUseLargePacket ? NearLinkConstants.maxChunkSize : 180;
+      chunkSize = canUseHighThroughputPayload
+          ? _highThroughputPayloadSize
+          : NearLinkConstants.maxChunkSize;
     } else if (isPeripheralMode && Platform.isAndroid) {
-      chunkSize = _androidPeripheralPayloadSize;
+      chunkSize = _highThroughputPayloadSize;
     } else if (isTargetIOS) {
-      // Android 作为 Central 发给 iOS Peripheral 时，让编码后的 NearLink 包尽量落在一次 ATT 写里。
-      chunkSize = _iosSingleWritePayloadSize;
-    } else {
+      // iOS Peripheral 端已经支持流式重组，这里不再把协议包压到单次 ATT 写以内。
       chunkSize = NearLinkConstants.maxChunkSize;
+    } else {
+      chunkSize = _highThroughputPayloadSize;
     }
     final totalChunks = (fileSize / chunkSize).ceil();
 
@@ -302,8 +304,8 @@ class FileTransferService extends ChangeNotifier {
     //   'totalChunks=$totalChunks',
     // );
 
-    // 只有 iOS 原生层实现了批量发送；Android 作为 Peripheral 走顺序发送。
-    if (isPeripheralMode && Platform.isIOS) {
+    // Peripheral 模式下统一交给原生批量入队，减少 Flutter/Native 往返。
+    if (isPeripheralMode) {
       await _sendChunksBatch(fileId, data, effectiveChunkSize, totalChunks);
     } else {
       await _sendChunksSequential(
@@ -311,14 +313,14 @@ class FileTransferService extends ChangeNotifier {
     }
   }
 
-  /// 批量发送数据块（用于 iOS 作为 Peripheral 向 Android 发送）
+  /// 批量发送数据块（用于 Peripheral 模式，交给原生层批量入队）
   Future<void> _sendChunksBatch(
     String fileId,
     Uint8List data,
     int chunkSize,
     int totalChunks,
   ) async {
-    const int batchSize = 256; // 增大批次，减少 Flutter/iOS 往返
+    final int batchSize = Platform.isAndroid ? 128 : 256;
 
     for (int batchStart = 0;
         batchStart < totalChunks;
@@ -368,6 +370,9 @@ class FileTransferService extends ChangeNotifier {
   ) async {
     final shouldOptimisticallyAdvanceProgress =
         !(Platform.isAndroid && _bluetoothService.isPeripheralConnected);
+    final transportBatchPacketCount = isTargetIOS ? 8 : 6;
+    BytesBuilder transportBuffer = BytesBuilder(copy: false);
+    int lastPacketIndexInBatch = -1;
 
     for (int i = 0; i < totalChunks; i++) {
       final start = i * chunkSize;
@@ -381,8 +386,19 @@ class FileTransferService extends ChangeNotifier {
         data: Uint8List.fromList(chunk),
       );
 
+      transportBuffer.add(packet.encode());
+      lastPacketIndexInBatch = i;
+      final shouldFlushTransportBatch =
+          i == totalChunks - 1 || (i + 1) % transportBatchPacketCount == 0;
+
+      if (!shouldFlushTransportBatch) {
+        continue;
+      }
+
       try {
-        final sendResult = await _bluetoothService.sendPacket(packet);
+        final sendResult = await _bluetoothService.sendData(
+          transportBuffer.toBytes(),
+        );
         if (!sendResult) {
           _updateTransfer(fileId,
               status: TransferStatus.failed, errorMessage: '发送失败');
@@ -396,18 +412,17 @@ class FileTransferService extends ChangeNotifier {
 
       // 更新发送进度
       if (shouldOptimisticallyAdvanceProgress &&
-          (i % 5 == 0 || i == totalChunks - 1)) {
+          (lastPacketIndexInBatch % 5 == 4 ||
+              lastPacketIndexInBatch == totalChunks - 1)) {
         _updateTransfer(
           fileId,
-          currentChunk: i + 1,
-          progress: (i + 1) / totalChunks,
+          currentChunk: lastPacketIndexInBatch + 1,
+          progress: (lastPacketIndexInBatch + 1) / totalChunks,
         );
       }
 
-      // 向 iOS 发送时添加极小延迟
-      if (isTargetIOS && i < totalChunks - 1 && i % 5 == 4) {
-        await Future.delayed(const Duration(milliseconds: 5));
-      }
+      transportBuffer = BytesBuilder(copy: false);
+      lastPacketIndexInBatch = -1;
     }
 
     await _finalizeOutgoingTransfer(fileId, data);
