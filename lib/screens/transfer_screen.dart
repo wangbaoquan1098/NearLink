@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import '../providers/nearlink_provider.dart';
 import '../models/nearlink_models.dart';
 import '../widgets/nearlink_widgets.dart';
+import '../utils/file_utils.dart';
+import '../utils/extensions.dart';
 
 /// 传输页面
 class TransferScreen extends StatefulWidget {
@@ -24,24 +26,25 @@ class _TransferScreenState extends State<TransferScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<NearLinkProvider>();
       _lastStatus = provider.currentTransfer?.status;
-      _lastConnectionState = provider.isConnected || provider.isPeripheralConnected;
+      _lastConnectionState =
+          provider.isConnected || provider.isPeripheralConnected;
       _startProgressMonitoring();
-      
+
       // 如果没有正在进行的传输任务，自动开始发送选中的文件
       if (provider.currentTransfer == null) {
         _startSending();
       }
     });
   }
-  
+
   /// 开始发送文件
   void _startSending() async {
     try {
       final provider = context.read<NearLinkProvider>();
       final scaffoldMessenger = ScaffoldMessenger.of(context);
-      
+
       final transfer = await provider.sendFile();
-      
+
       if (transfer == null && mounted) {
         scaffoldMessenger.showSnackBar(
           const SnackBar(
@@ -75,11 +78,12 @@ class _TransferScreenState extends State<TransferScreen> {
         timer.cancel();
         return;
       }
-      
+
       final provider = context.read<NearLinkProvider>();
-      
+
       // 检测连接断开
-      final isConnected = provider.isConnected || provider.isPeripheralConnected;
+      final isConnected =
+          provider.isConnected || provider.isPeripheralConnected;
       if (_lastConnectionState && !isConnected) {
         // 连接刚刚断开
         _lastConnectionState = false;
@@ -87,31 +91,31 @@ class _TransferScreenState extends State<TransferScreen> {
         return;
       }
       _lastConnectionState = isConnected;
-      
+
       if (provider.currentTransfer != null) {
         final transfer = provider.currentTransfer!;
-        
+
         // 检测传输完成
-        if (_lastStatus != TransferStatus.completed && 
+        if (_lastStatus != TransferStatus.completed &&
             transfer.status == TransferStatus.completed) {
           _onTransferComplete(transfer);
         }
-        
+
         // 检测传输失败
-        if (_lastStatus != TransferStatus.failed && 
+        if (_lastStatus != TransferStatus.failed &&
             transfer.status == TransferStatus.failed) {
           _onTransferFailed(transfer);
         }
-        
+
         _lastStatus = transfer.status;
       }
     });
   }
-  
+
   /// 连接断开时的处理
   void _onConnectionLost() {
     if (!mounted) return;
-    
+
     // 显示断开提示
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -120,7 +124,7 @@ class _TransferScreenState extends State<TransferScreen> {
         duration: Duration(seconds: 2),
       ),
     );
-    
+
     // 取消所有活跃传输
     final provider = context.read<NearLinkProvider>();
     for (final transfer in provider.activeTransfers) {
@@ -128,7 +132,7 @@ class _TransferScreenState extends State<TransferScreen> {
         provider.cancelTransfer(transfer.fileId);
       }
     }
-    
+
     // 延迟返回首页
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) {
@@ -139,29 +143,35 @@ class _TransferScreenState extends State<TransferScreen> {
 
   void _onTransferComplete(FileTransfer transfer) async {
     if (!mounted) return;
-    
+
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    scaffoldMessenger.hideCurrentSnackBar();
+
     // 显示成功提示
-    ScaffoldMessenger.of(context).showSnackBar(
+    scaffoldMessenger.showSnackBar(
       SnackBar(
-        content: Text('${transfer.filePath.isNotEmpty ? "发送" : "接收"}完成: ${transfer.fileName}'),
+        content: Text(
+            '${transfer.filePath.isNotEmpty ? "发送" : "接收"}完成: ${transfer.fileName}'),
         backgroundColor: NearLinkColors.success,
         duration: const Duration(seconds: 1),
       ),
     );
-    
+
     // 延迟一点返回主页，让用户看到提示
     await Future.delayed(const Duration(milliseconds: 800));
-    
+
     if (!mounted) return;
-    
+
     // 返回主页
     Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
   void _onTransferFailed(FileTransfer transfer) {
     if (!mounted) return;
-    
-    ScaffoldMessenger.of(context).showSnackBar(
+
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    scaffoldMessenger.hideCurrentSnackBar();
+    scaffoldMessenger.showSnackBar(
       SnackBar(
         content: Text('传输失败: ${transfer.errorMessage ?? "未知错误"}'),
         backgroundColor: NearLinkColors.error,
@@ -195,7 +205,8 @@ class _TransferScreenState extends State<TransferScreen> {
         ],
       ),
       body: Selector<NearLinkProvider, bool>(
-        selector: (_, provider) => provider.isConnected || provider.isPeripheralConnected,
+        selector: (_, provider) =>
+            provider.isConnected || provider.isPeripheralConnected,
         builder: (context, isConnected, child) {
           if (!isConnected) {
             // 连接断开时显示全屏提示，自动返回按钮
@@ -250,7 +261,7 @@ class _TransferScreenState extends State<TransferScreen> {
               ),
             );
           }
-          
+
           // 连接正常时显示传输界面
           return Column(
             children: [
@@ -272,7 +283,8 @@ class _TransferScreenState extends State<TransferScreen> {
   /// 连接信息静态版本（连接状态变化时才重建）
   Widget _buildConnectionInfoStatic(BuildContext context) {
     return Selector<NearLinkProvider, bool>(
-      selector: (_, provider) => provider.isConnected || provider.isPeripheralConnected,
+      selector: (_, provider) =>
+          provider.isConnected || provider.isPeripheralConnected,
       builder: (context, isConnected, child) {
         if (!isConnected) {
           return Container(
@@ -318,10 +330,12 @@ class _TransferScreenState extends State<TransferScreen> {
 
   /// 底部操作优化版本（只监听状态和传输对象）
   Widget _buildBottomActionsOptimized(BuildContext context) {
-    return Selector<NearLinkProvider, ({FileTransfer? transfer, bool isTransferring})>(
+    return Selector<NearLinkProvider,
+        ({FileTransfer? transfer, bool isTransferring})>(
       selector: (_, provider) => (
         transfer: provider.currentTransfer,
-        isTransferring: provider.currentTransfer?.status == TransferStatus.transferring,
+        isTransferring:
+            provider.currentTransfer?.status == TransferStatus.transferring,
       ),
       builder: (context, data, child) {
         return _buildBottomActions(context, data.transfer);
@@ -331,14 +345,14 @@ class _TransferScreenState extends State<TransferScreen> {
 
   Widget _buildConnectionInfo(NearLinkProvider provider) {
     final remoteDevice = provider.connectedRemoteDevice;
-    
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [
-            NearLinkColors.success.withAlpha((0.15 * 255).toInt()),
-            NearLinkColors.success.withAlpha((0.05 * 255).toInt()),
+            NearLinkColors.success.o(0.15),
+            NearLinkColors.success.o(0.05),
           ],
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
@@ -350,7 +364,7 @@ class _TransferScreenState extends State<TransferScreen> {
             width: 56,
             height: 56,
             decoration: BoxDecoration(
-              color: NearLinkColors.success.withAlpha((0.2 * 255).toInt()),
+              color: NearLinkColors.success.o(0.2),
               borderRadius: BorderRadius.circular(16),
             ),
             child: const Icon(
@@ -386,11 +400,13 @@ class _TransferScreenState extends State<TransferScreen> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  remoteDevice?.name.isNotEmpty == true 
-                      ? remoteDevice!.name 
-                      : provider.connectedDevice?.platformName 
-                          ?? provider.lastIncomingDeviceName  // iOS 作为 Peripheral 被连接时显示对方名称
-                          ?? '未知设备',
+                  remoteDevice?.name.isNotEmpty == true
+                      ? remoteDevice!.name
+                      : provider.connectedDevice?.platformName ??
+                          provider
+                              .lastIncomingDeviceName // iOS 作为 Peripheral 被连接时显示对方名称
+                          ??
+                          '未知设备',
                   style: const TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
@@ -410,7 +426,7 @@ class _TransferScreenState extends State<TransferScreen> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(
-              color: NearLinkColors.success.withAlpha((0.2 * 255).toInt()),
+              color: NearLinkColors.success.o(0.2),
               borderRadius: BorderRadius.circular(20),
             ),
             child: const Row(
@@ -436,7 +452,7 @@ class _TransferScreenState extends State<TransferScreen> {
 
   Widget _buildBottomActions(BuildContext context, FileTransfer? transfer) {
     final provider = context.read<NearLinkProvider>();
-    
+
     return Container(
       padding: const EdgeInsets.all(16),
       child: Row(
@@ -455,7 +471,8 @@ class _TransferScreenState extends State<TransferScreen> {
                 ),
               ),
             )
-          else if (transfer != null && transfer.status == TransferStatus.completed)
+          else if (transfer != null &&
+              transfer.status == TransferStatus.completed)
             Expanded(
               child: ElevatedButton.icon(
                 onPressed: () => Navigator.pop(context),
@@ -554,29 +571,6 @@ class _TransferScreenState extends State<TransferScreen> {
       ),
     );
   }
-
-  IconData _getFileIcon(String mimeType) {
-    if (mimeType.startsWith('image/')) return Icons.image;
-    if (mimeType.startsWith('video/')) return Icons.video_file;
-    if (mimeType.startsWith('audio/')) return Icons.audio_file;
-    if (mimeType.contains('pdf')) return Icons.picture_as_pdf;
-    if (mimeType.contains('word') || mimeType.contains('document')) {
-      return Icons.description;
-    }
-    if (mimeType.contains('sheet') || mimeType.contains('excel')) {
-      return Icons.table_chart;
-    }
-    return Icons.insert_drive_file;
-  }
-
-  String _formatFileSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
 }
 
 /// 独立的进度显示 widget，只在 transfer 变化时重建
@@ -612,7 +606,7 @@ class _TransferProgressWidget extends StatelessWidget {
                             child: CircularProgressIndicator(
                               value: transfer.progress,
                               strokeWidth: 8,
-                              backgroundColor: NearLinkColors.primary.withAlpha((0.15 * 255).toInt()),
+                              backgroundColor: NearLinkColors.primary.o(0.15),
                               valueColor: AlwaysStoppedAnimation<Color>(
                                 _getStatusColor(transfer.status),
                               ),
@@ -622,11 +616,12 @@ class _TransferProgressWidget extends StatelessWidget {
                             width: 100,
                             height: 100,
                             decoration: BoxDecoration(
-                              color: _getStatusColor(transfer.status).withAlpha((0.1 * 255).toInt()),
+                              color: _getStatusColor(transfer.status).o(0.1),
                               shape: BoxShape.circle,
                             ),
                             child: Icon(
-                              _getStatusIcon(transfer.status, transfer.mimeType),
+                              _getStatusIcon(
+                                  transfer.status, transfer.mimeType),
                               size: 48,
                               color: _getStatusColor(transfer.status),
                             ),
@@ -646,9 +641,10 @@ class _TransferProgressWidget extends StatelessWidget {
                       const SizedBox(height: 8),
                       // 状态文字
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 6),
                         decoration: BoxDecoration(
-                          color: _getStatusColor(transfer.status).withAlpha((0.1 * 255).toInt()),
+                          color: _getStatusColor(transfer.status).o(0.1),
                           borderRadius: BorderRadius.circular(20),
                         ),
                         child: Text(
@@ -726,7 +722,7 @@ class _TransferProgressWidget extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: NearLinkColors.primary.withAlpha((0.05 * 255).toInt()),
+        color: NearLinkColors.primary.o(0.05),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
@@ -740,7 +736,7 @@ class _TransferProgressWidget extends StatelessWidget {
           Container(
             width: 1,
             height: 30,
-            color: NearLinkColors.textSecondary.withAlpha((0.2 * 255).toInt()),
+            color: NearLinkColors.textSecondary.o(0.2),
           ),
           _buildDetailItem(
             Icons.layers,
@@ -750,7 +746,7 @@ class _TransferProgressWidget extends StatelessWidget {
           Container(
             width: 1,
             height: 30,
-            color: NearLinkColors.textSecondary.withAlpha((0.2 * 255).toInt()),
+            color: NearLinkColors.textSecondary.o(0.2),
           ),
           _buildDetailItem(
             Icons.speed,
@@ -786,88 +782,45 @@ class _TransferProgressWidget extends StatelessWidget {
     );
   }
 
-  String _formatFileSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
+  String _formatFileSize(int bytes) => FileUtils.formatFileSize(bytes);
 
-  String _estimateRemainingTime(FileTransfer transfer) {
-    if (transfer.progress <= 0) return '--';
-    final elapsed = DateTime.now().difference(transfer.startTime);
-    final total = elapsed.inMilliseconds / transfer.progress;
-    final remaining = total - elapsed.inMilliseconds;
-    if (remaining < 1000) return '< 1 秒';
-    if (remaining < 60000) return '${(remaining / 1000).ceil()} 秒';
-    return '${(remaining / 60000).ceil()} 分钟';
-  }
+  String _estimateRemainingTime(FileTransfer transfer) =>
+      FileUtils.estimateRemainingTime(
+        progress: transfer.progress,
+        startTime: transfer.startTime,
+      );
 
-  String _calculateSpeed(FileTransfer transfer) {
-    if (transfer.progress <= 0) return '-- KB/s';
-    final elapsed = DateTime.now().difference(transfer.startTime);
-    if (elapsed.inSeconds == 0) return '-- KB/s';
-    final bytesPerSecond = (transfer.fileSize * transfer.progress) / elapsed.inSeconds;
-    if (bytesPerSecond < 1024) return '${bytesPerSecond.toStringAsFixed(0)} B/s';
-    if (bytesPerSecond < 1024 * 1024) return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
-    return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MB/s';
-  }
+  String _calculateSpeed(FileTransfer transfer) => FileUtils.calculateSpeed(
+        fileSize: transfer.fileSize,
+        progress: transfer.progress,
+        startTime: transfer.startTime,
+      );
 
   IconData _getStatusIcon(TransferStatus status, String mimeType) {
-    switch (status) {
-      case TransferStatus.completed:
-        return Icons.check_circle;
-      case TransferStatus.failed:
-        return Icons.error;
-      case TransferStatus.cancelled:
-        return Icons.cancel;
-      default:
-        if (mimeType.startsWith('image/')) return Icons.image;
-        if (mimeType.startsWith('video/')) return Icons.video_file;
-        if (mimeType.startsWith('audio/')) return Icons.audio_file;
-        if (mimeType.contains('pdf')) return Icons.picture_as_pdf;
-        if (mimeType.contains('word') || mimeType.contains('document')) {
-          return Icons.description;
-        }
-        if (mimeType.contains('sheet') || mimeType.contains('excel')) {
-          return Icons.table_chart;
-        }
-        return Icons.insert_drive_file;
-    }
+    if (status == TransferStatus.completed) return Icons.check_circle;
+    if (status == TransferStatus.failed) return Icons.error;
+    if (status == TransferStatus.cancelled) return Icons.cancel;
+    return FileUtils.getFileIcon(mimeType);
   }
 
   String _getStatusText(TransferStatus status) {
-    switch (status) {
-      case TransferStatus.idle:
-        return '等待开始';
-      case TransferStatus.connecting:
-        return '连接中...';
-      case TransferStatus.handshaking:
-        return '握手...';
-      case TransferStatus.transferring:
-        return '传输中...';
-      case TransferStatus.completed:
-        return '传输完成';
-      case TransferStatus.failed:
-        return '传输失败';
-      case TransferStatus.cancelled:
-        return '已取消';
-    }
+    return switch (status) {
+      TransferStatus.idle => '等待开始',
+      TransferStatus.connecting => '连接中...',
+      TransferStatus.handshaking => '握手...',
+      TransferStatus.transferring => '传输中...',
+      TransferStatus.completed => '传输完成',
+      TransferStatus.failed => '传输失败',
+      TransferStatus.cancelled => '已取消',
+    };
   }
 
   Color _getStatusColor(TransferStatus status) {
-    switch (status) {
-      case TransferStatus.transferring:
-        return NearLinkColors.primary;
-      case TransferStatus.completed:
-        return NearLinkColors.success;
-      case TransferStatus.failed:
-      case TransferStatus.cancelled:
-        return NearLinkColors.error;
-      default:
-        return NearLinkColors.textSecondary;
-    }
+    return switch (status) {
+      TransferStatus.transferring => NearLinkColors.primary,
+      TransferStatus.completed => NearLinkColors.success,
+      TransferStatus.failed || TransferStatus.cancelled => NearLinkColors.error,
+      _ => NearLinkColors.textSecondary,
+    };
   }
 }

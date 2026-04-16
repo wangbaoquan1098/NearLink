@@ -40,14 +40,16 @@ class MainActivity : FlutterActivity() {
     // NearLink 服务 UUID
     private val SERVICE_UUID = "0000FFFF-0000-1000-8000-00805F9B34FB"
 
+    private fun emitEvent(event: Map<String, Any?>) {
+        runOnUiThread {
+            eventSink?.success(event)
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         
-        // 初始化 GATT Server
-        gattServer = BleGattServer(this)
-        
-        // 设置 GATT Server 回调
-        setupGattServerCallbacks()
+        ensureGattServer()
         
         // 设置 Method Channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
@@ -63,6 +65,8 @@ class MainActivity : FlutterActivity() {
                         return@setMethodCallHandler
                     }
                     
+                    ensureGattServer()
+
                     // 先启动 GATT Server（服务需要先添加完成）
                     val gattSuccess = gattServer?.startServer() ?: false
                     
@@ -84,21 +88,36 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "disconnect" -> {
-                    // 完全断开连接，包括关闭GATT服务器
+                    // 断开当前连接，保留能力以便后续重新连接
                     stopBleAdvertising()
-                    gattServer?.stopServer()
+                    val disconnected = if (connectedDevice != null) {
+                        gattServer?.disconnectDevice(connectedDevice!!) ?: false
+                    } else {
+                        true
+                    }
                     connectedDevice = null
-                    result.success(true)
+                    result.success(disconnected)
                 }
                 "sendData" -> {
                     // Android 作为 Peripheral 发送数据给中心设备
                     val data = call.argument<ByteArray>("data")
+                    // android.util.Log.d("NearLink", "sendData 请求: dataSize=${data?.size}, connectedDevice=${connectedDevice?.address}")
                     if (data != null && connectedDevice != null) {
                         val success = gattServer?.sendData(connectedDevice!!, data) ?: false
+                        // android.util.Log.d("NearLink", "sendData 结果: success=$success")
                         result.success(success)
                     } else {
+                        // android.util.Log.w("NearLink", "sendData 失败: data=${data != null}, connectedDevice=${connectedDevice != null}")
                         result.success(false)
                     }
+                }
+                "getPendingNotificationCount" -> {
+                    val pendingCount = if (connectedDevice != null) {
+                        gattServer?.getPendingNotificationCount(connectedDevice!!) ?: 0
+                    } else {
+                        0
+                    }
+                    result.success(pendingCount)
                 }
                 "getConnectedCentralsCount" -> {
                     result.success(if (connectedDevice != null) 1 else 0)
@@ -132,14 +151,13 @@ class MainActivity : FlutterActivity() {
                 android.util.Log.d("NearLink", "GATT 设备已连接: ${device.address}")
                 connectedDevice = device
                 
-                // 必须在主线程调用 eventSink
-                runOnUiThread {
-                    eventSink?.success(mapOf(
+                emitEvent(
+                    mapOf(
                         "event" to "centralConnected",
                         "centralId" to device.address,
                         "mtu" to 512
-                    ))
-                }
+                    )
+                )
             }
             
             override fun onDeviceDisconnected(device: BluetoothDevice) {
@@ -148,24 +166,22 @@ class MainActivity : FlutterActivity() {
                     connectedDevice = null
                 }
                 
-                // 必须在主线程调用 eventSink
-                runOnUiThread {
-                    eventSink?.success(mapOf(
+                emitEvent(
+                    mapOf(
                         "event" to "centralDisconnected",
                         "centralId" to device.address
-                    ))
-                }
+                    )
+                )
             }
             
             override fun onDataReceived(device: BluetoothDevice, data: ByteArray) {
-                // 必须在主线程调用 eventSink
-                runOnUiThread {
-                    eventSink?.success(mapOf(
+                emitEvent(
+                    mapOf(
                         "event" to "dataReceived",
                         "centralId" to device.address,
                         "data" to data
-                    ))
-                }
+                    )
+                )
             }
         })
     }
@@ -179,6 +195,13 @@ class MainActivity : FlutterActivity() {
             advertiseGranted && connectGranted && scanGranted
         } else {
             true
+        }
+    }
+
+    private fun ensureGattServer() {
+        if (gattServer == null) {
+            gattServer = BleGattServer(this)
+            setupGattServerCallbacks()
         }
     }
 
@@ -223,6 +246,7 @@ class MainActivity : FlutterActivity() {
             bluetoothLeAdvertiser?.startAdvertising(settings, dataBuilder.build(), advertiseCallback)
             isAdvertising = true
             android.util.Log.d("NearLink", "BLE 广播已启动 (包含 Service UUID: $serviceUuid)")
+            emitEvent(mapOf("event" to "advertisingStarted"))
             return true
         } catch (e: SecurityException) {
             android.util.Log.e("NearLink", "广播权限不足: ${e.message}")
@@ -243,6 +267,7 @@ class MainActivity : FlutterActivity() {
             android.util.Log.e("NearLink", "停止广播权限不足: ${e.message}")
         }
         isAdvertising = false
+        emitEvent(mapOf("event" to "advertisingStopped"))
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
