@@ -85,8 +85,8 @@ extension StringExtension on String {
 extension DurationExtension on Duration {
   /// 格式化为易读的时间字符串
   String get formatted {
-    if (inSeconds < 60) return '${inSeconds}秒';
-    if (inMinutes < 60) return '${inMinutes}分钟';
-    return '${inHours}小时 ${inMinutes % 60}分钟';
+    if (inSeconds < 60) return '$inSeconds秒';
+    if (inMinutes < 60) return '$inMinutes分钟';
+    return '$inHours小时 ${inMinutes % 60}分钟';
   }
 }

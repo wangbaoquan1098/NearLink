@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**NearLink** is a cross-platform (Android/iOS) Bluetooth file transfer app built with Flutter. It enables P2P file sharing without requiring internet connectivity. The app uses BLE GATT for small files (<5MB) and falls back to AirDrop for large files on iOS.
+**NearLink** is a Flutter app for cross-platform (Android/iOS) peer-to-peer file transfer over Bluetooth. The app uses BLE discovery + GATT transport, supports both central and peripheral roles, and contains native Android/iOS code to advertise and receive data when the device is acting as a BLE peripheral.
 
 ## Common Commands
 
@@ -12,137 +12,144 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 flutter pub get
 
-# Run the app (debug mode)
+# Run app
 flutter run
-
-# Run on specific device
 flutter run -d <device_id>
 
-# Build for production
-flutter build apk              # Android APK
-flutter build appbundle      # Android App Bundle
-flutter build ios            # iOS (requires macOS & Xcode)
-
-# Analyze and lint
+# Analyze
 flutter analyze
 
-# Run tests
+# Run all tests
 flutter test
 
-# iOS specific setup
+# Run a single test file
+flutter test test/widget_test.dart
+
+# Build release artifacts
+flutter build apk
+flutter build appbundle
+flutter build ios
+
+# iOS native dependency setup
 cd ios && pod install
 ```
 
+At the time this file was updated, `flutter analyze` completed with no issues.
+
 ## Architecture Overview
 
-### Core Services (Singleton Pattern)
+### App structure
 
-The app uses a service-oriented architecture with singletons for state management:
+The app is organized around a thin Flutter UI layer, a Provider-based app-state layer, and singleton services for BLE and file transfer:
 
-1. **NearLinkBluetoothService** (`lib/bluetooth/nearlink_bluetooth_service.dart`)
-   - Central BLE manager for scanning, connecting, and GATT communication
-   - Handles both Central and Peripheral modes
-   - Supports both Android and iOS native advertising via MethodChannel
-   - Key constants: `NearLinkConstants.serviceUuid`, `charTxUuid`, `charRxUuid`
-   - Max chunk size: 512 bytes (BLE MTU limit)
+- `lib/main.dart` wires the app with a single `ChangeNotifierProvider` for `NearLinkProvider` and launches `DiscoveryScreen`.
+- `lib/providers/nearlink_provider.dart` is the orchestration layer used by the UI. It initializes services, exposes app state to widgets, handles permission flows, and bridges passive connection / incoming transfer events into UI navigation.
+- `lib/bluetooth/nearlink_bluetooth_service.dart` owns BLE scanning, connection state, GATT setup, advertising state, packet send/receive, heartbeat monitoring, and platform-channel integration for native peripheral mode.
+- `lib/services/file_transfer_service.dart` implements the transfer protocol on top of the Bluetooth service: preparing files, optional image compression, chunking, ACK/batch-ACK flow, receive buffering, persistence, and transfer lifecycle state.
+- `lib/models/nearlink_models.dart` defines shared enums, `FileTransfer`, `NearbyDevice`, and the `NearLinkPacket` binary protocol.
 
-2. **FileTransferService** (`lib/services/file_transfer_service.dart`)
-   - Manages file preparation, chunking, and transfer state
-   - Handles image compression via `flutter_image_compress`
-   - Tracks received chunks for resume support
+### UI flow
 
-3. **NearLinkProvider** (`lib/providers/nearlink_provider.dart`)
-   - Main application state management using Provider pattern
-   - Bridges UI with Bluetooth and FileTransfer services
-   - Manages passive connection events and file reception
+There are two main screens:
 
-### Protocol Layer
+- `lib/screens/discovery_screen.dart`: scan for devices, start/stop advertising, pick files/photos, and react to passive incoming transfers.
+- `lib/screens/transfer_screen.dart`: display live transfer progress, handle disconnect/failure UX, and provide the iOS AirDrop fallback entry point.
 
-**NearLinkPacket** (`lib/models/nearlink_models.dart`) defines the binary protocol:
+Typical active-send flow:
 
-```dart
-// Packet structure (64-byte header + payload)
-- Type (1 byte)
-- FileId (32 bytes, hyphen-stripped UUID)
-- ChunkIndex (2 bytes, big-endian)
-- TotalChunks (2 bytes, big-endian)
-- PayloadSize (2 bytes, big-endian)
-- Checksum (8 bytes, CRC32 hex)
-- Timestamp (4 bytes, big-endian)
-- Reserved (13 bytes)
-```
+1. `DiscoveryScreen` triggers scan or advertising through `NearLinkProvider`
+2. Provider delegates BLE work to `NearLinkBluetoothService`
+3. User picks a file/image
+4. Provider asks `FileTransferService` to prepare and send it
+5. `TransferScreen` observes provider state until completion/failure
 
-Packet types: `handshake`, `fileInfo`, `chunk`, `chunkAck`, `transferComplete`, `cancel`, `error`, `ping/pong`
+Passive receive flow is event-driven: `NearLinkProvider` listens to `FileTransferService` streams and pushes the UI into `TransferScreen` when an incoming transfer is detected.
 
-### Platform-Specific Code
+### State and service patterns
 
-**Android** (`android/app/src/main/kotlin/com/nearlink/nearlink/`):
-- `MainActivity.kt`: Flutter entry point
-- `BleGattServer.kt`: BLE Peripheral (GATT server) implementation
-- MethodChannel: `com.nearlink/ble_advertise`
+The main service classes are implemented as singletons via factory constructors:
 
-**iOS** (`ios/Runner/`):
-- `BleAdvertiser.swift`: CoreBluetooth peripheral advertising
-- `AppDelegate.swift`: App lifecycle handling
-- EventChannel: `com.nearlink/ble_advertise_events`
+- `NearLinkProvider`
+- `NearLinkBluetoothService`
+- `FileTransferService`
+- `PermissionService`
 
-### Key Design Decisions
+This means changes in one layer are usually globally visible; avoid assuming fresh instances per screen or per request.
 
-1. **Dual Advertising Strategy**:
-   - Android: Uses Manufacturer Data with magic bytes `0x4E, 0x45, 0x41, 0x52` ("NEAR")
-   - iOS: Uses Service UUID advertising (0xFFFF) since Manufacturer Data is restricted
+### BLE transport and protocol
 
-2. **Connection Modes**:
-   - Central mode: App scans and connects to other devices
-   - Peripheral mode: App advertises and accepts connections (native implementation required)
+`NearLinkPacket` in `lib/models/nearlink_models.dart` is the core on-wire protocol. Packets use a fixed 64-byte header plus payload, with fields for packet type, file ID, chunk index, chunk count, payload size, checksum, and timestamp.
 
-3. **Platform Differences**:
-   - Android supports background file transfer via foreground service
-   - iOS requires app to remain in foreground during transfer
-   - Files >50MB on iOS trigger AirDrop fallback via `share_plus`
+Important protocol details:
 
-4. **Data Flow**:
-   - DiscoveryScreen → TransferScreen for active sending
-   - Provider streams (`onIncomingConnection`, `onTransferReceived`) handle passive reception
+- File IDs are UUIDs with hyphens stripped before encoding.
+- Packet types include handshake / handshakeAck, fileInfo / fileInfoAck, chunk, chunkAck, batchAck, transferComplete / transferCompleteAck, cancel, error, ping, and pong.
+- `NearLinkBluetoothService` maintains a byte buffer to reassemble fragmented BLE writes before decoding full packets.
+- `FileTransferService` layers transfer semantics on top of packets: file metadata exchange, chunk streaming, ACK throttling, transfer completion handshakes, and stalled-transfer watchdogs.
 
-## Dependencies to Know
+### Throughput and chunk sizing
 
-- `flutter_blue_plus`: BLE communication (the core dependency)
-- `nfc_manager`: Android NFC trigger (optional feature)
-- `flutter_image_compress`: WebP compression for photos
-- `share_plus`: AirDrop fallback on iOS
-- `provider`: State management
-- `permission_handler`: Runtime permissions (Bluetooth, Location, Photos)
+Do not assume one fixed BLE payload size everywhere.
 
-## Testing
+- `NearLinkConstants.maxChunkSize` is **440 bytes**, not 512.
+- `FileTransferService` dynamically chooses chunk sizes based on whether the local device is acting as peripheral/central and whether the peer is iOS.
+- There is a higher-throughput payload mode (`maxChunkSize * 2`) used in some paths, relying on protocol-level reassembly instead of a strict one-packet-per-ATT-write assumption.
 
-The project currently has minimal test coverage. Tests should be added to the `test/` directory. Integration tests require physical devices due to Bluetooth hardware dependency.
+If you change transfer logic, read both:
 
-## Utility Files
+- `lib/bluetooth/nearlink_bluetooth_service.dart`
+- `lib/services/file_transfer_service.dart`
 
-- **ColorOpacity Extension** (`lib/utils/extensions.dart`)
-  - Provides `.o(double)` method for colors: `NearLinkColors.primary.o(0.1)`
-  - Replaces verbose `.withAlpha((0.x * 255).toInt())` pattern
-  - Also includes BuildContext, String, and Duration extensions
+The correctness of one often depends on assumptions in the other.
 
-- **File Utilities** (`lib/utils/file_utils.dart`)
-  - Centralized MIME type detection and file icon mapping
-  - File size formatting (KB, MB, GB)
-  - Used by TransferScreen for consistent file display
+### Peripheral mode and native platform code
 
-## Permission Handling Pattern
+Flutter handles central-mode BLE through `flutter_blue_plus`, but peripheral-mode advertising / receiving depends on native code:
 
-Permissions are requested on-demand (not at startup) to improve UX:
+**Android** (`android/app/src/main/kotlin/com/nearlink/nearlink/`)
+- `MainActivity.kt` exposes the `com.nearlink/ble_advertise` method channel and `com.nearlink/ble_advertise_events` event channel.
+- `BleGattServer.kt` runs the Android GATT server, tracks connected centrals, manages notification subscriptions, fragments outbound notifications to MTU-safe sizes, and reports incoming writes back to Flutter.
+- Android advertising identifies NearLink devices via manufacturer data with magic bytes for `NEAR`.
 
-1. **Delayed Request**: `checkAndRequestPermissions()` is called when user performs an action (scan/advertise), not during app init
-2. **Explanation First**: Shows permission explanation dialog before system dialog
-3. **State-aware**: When toggling advertising, only check permissions when starting (not stopping)
+**iOS** (`ios/Runner/`)
+- `BleAdvertiser.swift` owns `CBPeripheralManager`, creates the NearLink service/characteristics, handles peripheral advertising, reassembles inbound writes, and emits connection/data events back to Flutter.
+- `AppDelegate.swift` installs the method/event channel bridge after Flutter engine startup.
+- iOS advertising uses local name + service UUID discovery rather than Android-style manufacturer data.
 
-See: `lib/providers/nearlink_provider.dart` lines 194-215 and `lib/screens/discovery_screen.dart` lines 736-746
+### Discovery model
 
-## Common Issues
+Scanning logic in `NearLinkBluetoothService` supports both platform advertisement styles:
 
-- **iOS**: Background execution is restricted; app must stay in foreground during transfer
-- **Android**: Location permission required for Bluetooth scanning (system requirement)
-- **MTU negotiation**: iOS max MTU is 185, Android supports up to 517
-- **Packet parsing**: The `_onDataReceived` method handles BLE packet fragmentation ("sticky packets")
+- Android advertisers are recognized from manufacturer data.
+- iOS advertisers are recognized from service UUID/local-name patterns.
+- Discovered devices are deduplicated first by device ID, then by `(platform + name)` to handle address churn.
+- The scanner may stop early once the same NearLink device is seen again, treating the result as stabilized.
+
+### Permissions and UX constraints
+
+Permission requests are intentionally **on-demand**, not part of app startup.
+
+- `NearLinkProvider.checkAndRequestPermissions()` first checks adapter power state.
+- It then uses `PermissionService` to check/request permissions only when the user initiates scan/advertising.
+- The app shows an explanation dialog before requesting system permissions.
+- When toggling advertising, permission checks are only needed when starting, not stopping.
+
+Platform specifics:
+
+- Android still requires location permission for BLE scanning.
+- iOS uses adapter authorization state rather than explicit runtime Bluetooth permission APIs.
+- iOS transfer assumes the app stays in the foreground.
+- `TransferScreen` exposes an AirDrop fallback path for iOS.
+
+### Utilities worth knowing
+
+- `lib/utils/extensions.dart`: includes the `Color.o(double)` opacity helper used throughout the UI.
+- `lib/utils/file_utils.dart`: centralizes MIME detection, file icons, and size formatting.
+- `lib/platforms/android/nfc_dispatcher.dart`: Android-only NFC trigger integration, initialized by `NearLinkProvider`.
+- `lib/platforms/ios/ios_platform_adapter.dart`: lightweight iOS platform checks / helpers used by provider and UI logic.
+
+## Testing Notes
+
+Current automated coverage is minimal. The repository currently contains `test/widget_test.dart` and does **not** contain an `integration_test/` directory.
+
+Bluetooth behavior is heavily device- and platform-dependent, so changes to connection, advertising, packet framing, ACK timing, or native peripheral code should be validated on real Android/iOS hardware whenever possible.

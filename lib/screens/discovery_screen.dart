@@ -67,28 +67,25 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   /// 显示文件保存完成 Toast
   void _showFileSavedToast(String savePath) {
     if (!mounted) return;
-    
-    // 统一显示根目录 NearLink
-    final directory = 'NearLink (根目录)';
-    
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Row(
+        content: const Row(
           children: [
-            const Icon(Icons.download_done, color: Colors.white, size: 20),
-            const SizedBox(width: 12),
+            Icon(Icons.download_done, color: Colors.white, size: 20),
+            SizedBox(width: 12),
             Expanded(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
+                  Text(
                     '文件已保存',
                     style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                   ),
                   Text(
-                    '保存位置: $directory',
-                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                    '保存位置: NearLink (根目录)',
+                    style: TextStyle(fontSize: 12, color: Colors.white70),
                   ),
                 ],
               ),
@@ -583,7 +580,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           children: [
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: () => _selectAndSendFile(context),
+                onPressed: _selectAndSendFile,
                 icon: const Icon(Icons.file_open),
                 label: const Text('选择文件发送'),
                 style: ElevatedButton.styleFrom(
@@ -690,14 +687,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         label = '开启广播';
         subLabel = '让其他设备可以发现你';
         break;
-      default:
-        buttonColor = Colors.blue.shade600;
-        icon = Icons.wifi_tethering_off;
-        label = '开启广播';
-        subLabel = '让其他设备可以发现你';
     }
-    
-    return Container(
+
+    return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
         onPressed: () => _toggleAdvertising(provider),
@@ -783,9 +775,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     await provider.connectToDevice(device);
   }
 
-  Future<void> _selectAndSendFile(BuildContext context) async {
+  Future<void> _selectAndSendFile() async {
+    if (!mounted) return;
+
     final provider = context.read<NearLinkProvider>();
     final navigator = Navigator.of(context);
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     try {
       PlatformFile? selectedFile;
@@ -798,7 +793,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         final pickedFile = await picker.pickImage(
           source: ImageSource.gallery,
         );
-        
+
         if (pickedFile != null) {
           // 使用 readAsBytes 获取文件数据，避免 iOS 沙盒路径问题
           final fileBytes = await pickedFile.readAsBytes();
@@ -831,10 +826,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         }
       }
 
-      // 检查 widget 是否仍然挂载且有文件被选中
       if (!mounted || !provider.hasSelectedFile) return;
 
-      // 获取文件名用于判断
       final fileName = fileFromPicker
           ? selectedFile!.name
           : (provider.selectedFileName ?? 'photo.jpg');
@@ -843,12 +836,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           : (provider.selectedFileBytes?.length ?? 0);
       final isImage = _isImageFile(fileName);
 
-      // iOS 大文件提示
       if (provider.isIOS && fileSize > 50 * 1024 * 1024) {
+        if (!mounted) return;
         final advice = provider.getIosTransferAdvice(fileSize);
-        showDialog(
+        await showDialog<void>(
           context: context,
-          builder: (context) => AlertDialog(
+          builder: (dialogContext) => AlertDialog(
             title: const Row(
               children: [
                 Icon(Icons.info_outline, color: NearLinkColors.warning),
@@ -859,12 +852,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             content: Text(advice),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(context),
+                onPressed: () => Navigator.pop(dialogContext),
                 child: const Text('继续蓝牙传输'),
               ),
               ElevatedButton.icon(
                 onPressed: () {
-                  Navigator.pop(context);
+                  Navigator.pop(dialogContext);
                 },
                 icon: const Icon(Icons.ios_share),
                 label: const Text('使用 AirDrop'),
@@ -872,32 +865,30 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             ],
           ),
         );
-        return;  // 等待用户选择
+        return;
       }
 
-      // 如果是图片文件，询问是否压缩
       if (isImage && fileSize > 100 * 1024) {
+        if (!mounted) return;
         final fakeFile = PlatformFile(name: fileName, size: fileSize);
         final shouldCompress = await _showImageCompressionDialog(context, fakeFile);
         if (!mounted) return;
         provider.setCompressImages(shouldCompress);
       }
 
-      // 跳转到传输页面
       navigator.push(
         MaterialPageRoute(
           builder: (context) => const TransferScreen(),
         ),
       );
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('选择文件失败: $e'),
-            backgroundColor: NearLinkColors.error,
-          ),
-        );
-      }
+      if (!mounted) return;
+      scaffoldMessenger.showSnackBar(
+        SnackBar(
+          content: Text('选择文件失败: $e'),
+          backgroundColor: NearLinkColors.error,
+        ),
+      );
     }
   }
   
