@@ -158,7 +158,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "clearTransferBuffers" -> {
                     val cleared = if (connectedDevice != null) {
-                        gattServer?.clearPendingNotifications(connectedDevice!!) ?: false
+                        gattServer?.clearTransferBuffers(connectedDevice!!) ?: false
                     } else {
                         true
                     }

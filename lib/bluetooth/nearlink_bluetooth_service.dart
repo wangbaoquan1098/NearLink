@@ -1169,12 +1169,26 @@ class NearLinkBluetoothService extends ChangeNotifier {
     required int writeGeneration,
   }) async {
     try {
-      // 检查特征值是否支持不带响应写入
+      final PacketType? packetType = _peekLeadingPacketType(data);
+      // Android 作为 Central 向 iOS 发送时，只对控制包保留带响应写入，
+      // 大数据 chunk 恢复无响应高吞吐发送，避免速度掉到几 KB/s。
+      final bool forceWriteWithResponse = Platform.isAndroid &&
+          isTargetIOS &&
+          _shouldForceWriteWithResponse(packetType);
       final bool canWriteWithoutResponse =
-          _rxCharacteristic!.properties.writeWithoutResponse;
-      final int writeWindowSize =
-          canWriteWithoutResponse ? (isTargetIOS ? 1 : 8) : 1;
+          _rxCharacteristic!.properties.writeWithoutResponse &&
+              !forceWriteWithResponse;
+      final int writeWindowSize = canWriteWithoutResponse
+          ? (isTargetIOS ? (packetType == PacketType.chunk ? 6 : 2) : 8)
+          : 1;
       final pendingWrites = <Future<void>>[];
+      final Duration interWriteDelay = forceWriteWithResponse
+          ? const Duration(milliseconds: 8)
+          : (canWriteWithoutResponse &&
+                  isTargetIOS &&
+                  packetType != PacketType.chunk
+              ? const Duration(milliseconds: 1)
+              : Duration.zero);
 
       final int chunkSize = isTargetIOS ? 180 : 512;
       // 高频打印已禁用以提升性能
@@ -1192,6 +1206,11 @@ class NearLinkBluetoothService extends ChangeNotifier {
         final chunk = data.sublist(offset, end);
 
         try {
+          if (writeGeneration != _centralWriteGeneration) {
+            _errorMessage = '发送已取消';
+            return false;
+          }
+
           // 根据特征值属性选择写入模式
           final writeFuture = _rxCharacteristic!.write(
             chunk,
@@ -1207,6 +1226,14 @@ class NearLinkBluetoothService extends ChangeNotifier {
               _errorMessage = '发送已取消';
               return false;
             }
+
+            if (interWriteDelay > Duration.zero && offset < data.length) {
+              await Future.delayed(interWriteDelay);
+              if (writeGeneration != _centralWriteGeneration) {
+                _errorMessage = '发送已取消';
+                return false;
+              }
+            }
           }
         } catch (writeError) {
           // GATT_INVALID_HANDLE 通常表示连接已断开
@@ -1221,14 +1248,6 @@ class NearLinkBluetoothService extends ChangeNotifier {
           return false;
         }
         offset = end;
-
-        // 当 Android 作为 Central 向 iOS Peripheral 连续写入时，适度让出时间片，避免队列溢出。
-        if (offset < data.length &&
-            canWriteWithoutResponse &&
-            isTargetIOS &&
-            pendingWrites.isEmpty) {
-          await Future.delayed(const Duration(milliseconds: 1));
-        }
       }
 
       if (pendingWrites.isNotEmpty) {
@@ -1245,13 +1264,64 @@ class NearLinkBluetoothService extends ChangeNotifier {
     }
   }
 
+  PacketType? _peekLeadingPacketType(Uint8List data) {
+    if (data.isEmpty) {
+      return null;
+    }
+
+    final int typeIndex = data.first;
+    if (typeIndex < 0 || typeIndex >= PacketType.values.length) {
+      return null;
+    }
+
+    return PacketType.values[typeIndex];
+  }
+
+  bool _shouldForceWriteWithResponse(PacketType? packetType) {
+    if (packetType == null) {
+      return true;
+    }
+
+    switch (packetType) {
+      case PacketType.chunk:
+        return false;
+      case PacketType.handshake:
+      case PacketType.handshakeAck:
+      case PacketType.handshakeReject:
+      case PacketType.fileInfo:
+      case PacketType.fileInfoAck:
+      case PacketType.fileInfoReject:
+      case PacketType.chunkAck:
+      case PacketType.chunkNack:
+      case PacketType.batchAck:
+      case PacketType.transferComplete:
+      case PacketType.transferCompleteAck:
+      case PacketType.cancel:
+      case PacketType.error:
+      case PacketType.ping:
+      case PacketType.pong:
+        return true;
+    }
+  }
+
   Future<bool> _sendDataFromIOSCentralToAndroid(Uint8List data) async {
     final completer = Completer<bool>();
+    final generation = _centralWriteGeneration;
 
     _iosCentralWriteQueue =
         _iosCentralWriteQueue.catchError((_) {}).then((_) async {
+      if (generation != _centralWriteGeneration) {
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        return;
+      }
+
       try {
-        final result = await _performIOSCentralWrite(data);
+        final result = await _performIOSCentralWrite(
+          data,
+          writeGeneration: generation,
+        );
         if (!completer.isCompleted) {
           completer.complete(result);
         }
@@ -1265,7 +1335,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
     return completer.future;
   }
 
-  Future<bool> _performIOSCentralWrite(Uint8List data) async {
+  Future<bool> _performIOSCentralWrite(
+    Uint8List data, {
+    required int writeGeneration,
+  }) async {
     final characteristic = _rxCharacteristic;
     final device = _connectedDevice;
     if (characteristic == null || device == null) {
@@ -1289,6 +1362,10 @@ class NearLinkBluetoothService extends ChangeNotifier {
     Future<bool> waitUntilReady() async {
       try {
         await writeReadyStream.first.timeout(const Duration(seconds: 10));
+        if (writeGeneration != _centralWriteGeneration) {
+          _errorMessage = '发送已取消';
+          return false;
+        }
         return true;
       } catch (_) {
         _errorMessage = '等待 iOS 写入队列就绪超时';
@@ -1299,9 +1376,17 @@ class NearLinkBluetoothService extends ChangeNotifier {
     int offset = 0;
 
     while (offset < data.length) {
+      if (writeGeneration != _centralWriteGeneration) {
+        _errorMessage = '发送已取消';
+        return false;
+      }
       var hitBackpressure = false;
 
       while (offset < data.length) {
+        if (writeGeneration != _centralWriteGeneration) {
+          _errorMessage = '发送已取消';
+          return false;
+        }
         final end = (offset + chunkSize < data.length)
             ? offset + chunkSize
             : data.length;

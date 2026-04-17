@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
@@ -19,38 +20,39 @@ class DiscoveryScreen extends StatefulWidget {
 }
 
 class _DiscoveryScreenState extends State<DiscoveryScreen> {
-  bool _showOnlyPhones = true;  // 默认只显示手机设备
+  static const Duration _iosPickerCooldown = Duration(milliseconds: 250);
+  bool _showOnlyPhones = true; // 默认只显示手机设备
   StreamSubscription<ConnectionSuccessEvent>? _incomingConnectionSubscription;
-  Timer? _advertiseRefreshTimer;  // 广播状态刷新定时器
+  Timer? _advertiseRefreshTimer; // 广播状态刷新定时器
   StreamSubscription<List<FileTransfer>>? _transferSubscription; // 监听传输任务
   StreamSubscription<String>? _fileSavedSubscription; // 监听文件保存完成
-  
+
   @override
   void initState() {
     super.initState();
     // 监听被动连接事件
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<NearLinkProvider>();
-      
+
       _incomingConnectionSubscription = provider.onIncomingConnection.listen(
         (event) {
           // 被动连接，静默处理，不显示任何提示
         },
       );
-      
+
       // 监听接收到的文件传输（作为接收方）
       _transferSubscription = provider.onTransferReceived.listen(
         (transfers) {
           _navigateToTransferScreen();
         },
       );
-      
+
       // 监听文件保存完成
       _fileSavedSubscription = provider.onFileSaved.listen(
         (savePath) => _showFileSavedToast(savePath),
       );
     });
-    
+
     // 启动广播状态刷新定时器
     _startAdvertiseRefreshTimer();
   }
@@ -63,7 +65,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     _fileSavedSubscription?.cancel();
     super.dispose();
   }
-  
+
   /// 显示文件保存完成 Toast
   void _showFileSavedToast(String savePath) {
     if (!mounted) return;
@@ -100,17 +102,17 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       ),
     );
   }
-  
+
   /// 跳转到传输页面（接收文件时）
   void _navigateToTransferScreen() {
     if (!mounted) return;
-    
+
     // 检查是否已经在 TransferScreen
     final route = ModalRoute.of(context);
     if (route?.settings.name == '/transfer') {
       return; // 已经在传输页面
     }
-    
+
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => const TransferScreen(),
@@ -118,7 +120,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       ),
     );
   }
-  
+
   /// 启动广播状态刷新定时器
   void _startAdvertiseRefreshTimer() {
     _advertiseRefreshTimer?.cancel();
@@ -185,14 +187,14 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           else if (state == NearLinkConnectionState.connected)
             _buildConnectedStatus(provider)
           else if (provider.isPeripheralConnected)
-            _buildPeripheralConnectedStatus(provider)  // iOS 被连接状态
+            _buildPeripheralConnectedStatus(provider) // iOS 被连接状态
           else
             _buildIdleStatus(),
         ],
       ),
     );
   }
-  
+
   /// 构建 iOS 作为 Peripheral 被连接的状态显示
   Widget _buildPeripheralConnectedStatus(NearLinkProvider provider) {
     return Column(
@@ -348,8 +350,10 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     }
 
     // 过滤设备列表
-    final devices = _showOnlyPhones 
-        ? provider.discoveredDevices.where((d) => d.isPossibleNearLinkDevice).toList()
+    final devices = _showOnlyPhones
+        ? provider.discoveredDevices
+            .where((d) => d.isPossibleNearLinkDevice)
+            .toList()
         : provider.discoveredDevices;
 
     // 按信号强度排序
@@ -360,9 +364,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         children: [
           Expanded(
             child: EmptyState(
-              icon: _showOnlyPhones ? Icons.filter_alt_off : Icons.bluetooth_disabled,
+              icon: _showOnlyPhones
+                  ? Icons.filter_alt_off
+                  : Icons.bluetooth_disabled,
               title: _showOnlyPhones ? '未发现手机设备' : '未发现附近设备',
-              description: _showOnlyPhones 
+              description: _showOnlyPhones
                   ? '试试关闭过滤查看所有设备'
                   : '请确保对方的 NearLink 已打开，并保持蓝牙开启',
             ),
@@ -375,12 +381,14 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     return Column(
       children: [
         // NearLink 优先设备
-        if (_showOnlyPhones && devices.any((d) => d.isPossibleNearLinkDevice)) ...[
+        if (_showOnlyPhones &&
+            devices.any((d) => d.isPossibleNearLinkDevice)) ...[
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: Row(
               children: [
-                const Icon(Icons.phone_android, size: 16, color: NearLinkColors.primary),
+                const Icon(Icons.phone_android,
+                    size: 16, color: NearLinkColors.primary),
                 const SizedBox(width: 4),
                 Text(
                   '可能的 NearLink 设备 (${devices.where((d) => d.isPossibleNearLinkDevice).length})',
@@ -393,26 +401,29 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               ],
             ),
           ),
-          ...devices.where((d) => d.isPossibleNearLinkDevice).map((device) => 
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: _buildDeviceCard(context, provider, device),
-            ),
-          ),
+          ...devices.where((d) => d.isPossibleNearLinkDevice).map(
+                (device) => Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  child: _buildDeviceCard(context, provider, device),
+                ),
+              ),
           const Divider(height: 24),
         ],
         // 其他设备
         Expanded(
           child: ListView.builder(
             padding: const EdgeInsets.symmetric(horizontal: 16),
-            itemCount: _showOnlyPhones 
+            itemCount: _showOnlyPhones
                 ? devices.where((d) => !d.isPossibleNearLinkDevice).length
                 : devices.length,
             itemBuilder: (context, index) {
-              final filteredDevices = _showOnlyPhones 
+              final filteredDevices = _showOnlyPhones
                   ? devices.where((d) => !d.isPossibleNearLinkDevice).toList()
                   : devices;
-              if (index >= filteredDevices.length) return const SizedBox.shrink();
+              if (index >= filteredDevices.length) {
+                return const SizedBox.shrink();
+              }
               final device = filteredDevices[index];
               return Padding(
                 padding: const EdgeInsets.only(bottom: 8),
@@ -426,7 +437,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     );
   }
 
-  Widget _buildDeviceCard(BuildContext context, NearLinkProvider provider, NearbyDevice device) {
+  Widget _buildDeviceCard(
+      BuildContext context, NearLinkProvider provider, NearbyDevice device) {
     return DeviceCard(
       name: device.name,
       signalLevel: device.signalLevel,
@@ -504,7 +516,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                     color: NearLinkColors.primary.o(0.1),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Icon(Icons.info_outline, color: NearLinkColors.primary),
+                  child: const Icon(Icons.info_outline,
+                      color: NearLinkColors.primary),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
@@ -532,9 +545,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               ],
             ),
             const SizedBox(height: 24),
-            _buildSimpleInfoRow('信号强度', '${device.rssi} dBm (${device.signalLevel} 格)'),
+            _buildSimpleInfoRow(
+                '信号强度', '${device.rssi} dBm (${device.signalLevel} 格)'),
             _buildSimpleInfoRow('设备类型', device.deviceType.name),
-            _buildSimpleInfoRow('NearLink', device.isPossibleNearLinkDevice ? '可能是' : '未知'),
+            _buildSimpleInfoRow(
+                'NearLink', device.isPossibleNearLinkDevice ? '可能是' : '未知'),
             const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
@@ -564,7 +579,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: const TextStyle(color: NearLinkColors.textSecondary)),
+          Text(label,
+              style: const TextStyle(color: NearLinkColors.textSecondary)),
           Text(value, style: const TextStyle(fontWeight: FontWeight.w500)),
         ],
       ),
@@ -592,7 +608,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             ),
             const SizedBox(width: 12),
             IconButton(
-              onPressed: () => _showDisconnectPeripheralDialog(context, provider),
+              onPressed: () =>
+                  _showDisconnectPeripheralDialog(context, provider),
               icon: const Icon(Icons.link_off),
               tooltip: '断开连接',
             ),
@@ -611,10 +628,12 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: provider.connectionState == NearLinkConnectionState.scanning
+                  onPressed: provider.connectionState ==
+                          NearLinkConnectionState.scanning
                       ? () => provider.stopScan()
                       : () async {
-                          final hasPermission = await provider.checkAndRequestPermissions(context);
+                          final hasPermission = await provider
+                              .checkAndRequestPermissions(context);
                           if (hasPermission) {
                             provider.startScan();
                           }
@@ -648,13 +667,13 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   Widget _buildAdvertiseButton(NearLinkProvider provider) {
     final advertisingState = provider.advertisingState;
     final duration = provider.advertiseDuration;
-    
+
     // 根据状态确定按钮样式
     Color buttonColor;
     IconData icon;
     String label;
     String? subLabel;
-    
+
     switch (advertisingState) {
       case AdvertisingState.starting:
         buttonColor = Colors.orange;
@@ -727,7 +746,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
 
     try {
       await provider.toggleAdvertising();
-      
+
       // 显示提示
       if (mounted) {
         final isAdvertising = provider.isAdvertising;
@@ -749,8 +768,6 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       }
     }
   }
-
-
 
   String _getScanButtonLabel(NearLinkConnectionState state) {
     switch (state) {
@@ -783,6 +800,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     try {
+      // 先清掉上一次选择结果，避免本次取消后误发旧文件。
+      provider.clearSelectedFile();
+
       PlatformFile? selectedFile;
       bool fileFromPicker = false;
 
@@ -801,11 +821,20 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           provider.selectFileWithBytes(fileName, fileBytes);
         } else {
           // 用户取消相册选择，尝试 file_picker 选择其他文件
-          final result = await FilePicker.platform.pickFiles(
-            type: FileType.any,
-            allowMultiple: false,
-            withData: true,
-          );
+          await Future.delayed(_iosPickerCooldown);
+          FilePickerResult? result;
+          try {
+            result = await FilePicker.platform.pickFiles(
+              type: FileType.any,
+              allowMultiple: false,
+              withData: true,
+            );
+          } on PlatformException catch (e) {
+            if (e.code == 'multiple_request') {
+              return;
+            }
+            rethrow;
+          }
           if (result != null && result.files.isNotEmpty) {
             selectedFile = result.files.first;
             fileFromPicker = true;
@@ -871,7 +900,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       if (isImage && fileSize > 100 * 1024) {
         if (!mounted) return;
         final fakeFile = PlatformFile(name: fileName, size: fileSize);
-        final shouldCompress = await _showImageCompressionDialog(context, fakeFile);
+        final shouldCompress =
+            await _showImageCompressionDialog(context, fakeFile);
         if (!mounted) return;
         provider.setCompressImages(shouldCompress);
       }
@@ -891,7 +921,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       );
     }
   }
-  
+
   /// 判断是否为图片文件
   bool _isImageFile(String fileName) {
     final lowerName = fileName.toLowerCase();
@@ -905,93 +935,97 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   }
 
   /// 显示图片压缩选项对话框
-  Future<bool> _showImageCompressionDialog(BuildContext context, PlatformFile file) async {
+  Future<bool> _showImageCompressionDialog(
+      BuildContext context, PlatformFile file) async {
     final originalSize = _formatFileSizeSimple(file.size);
 
     return await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Row(
-          children: [
-            Icon(Icons.image, color: NearLinkColors.primary),
-            SizedBox(width: 8),
-            Text('发送图片'),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              file.name,
-              style: const TextStyle(fontWeight: FontWeight.w600),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) => AlertDialog(
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Row(
+              children: [
+                Icon(Icons.image, color: NearLinkColors.primary),
+                SizedBox(width: 8),
+                Text('发送图片'),
+              ],
             ),
-            const SizedBox(height: 8),
-            Text(
-              '文件大小: $originalSize',
-              style: const TextStyle(color: NearLinkColors.textSecondary),
-            ),
-            const SizedBox(height: 16),
-            const Text(
-              '是否压缩图片以加快传输速度？',
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: NearLinkColors.primary.o(0.08),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  file.name,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '文件大小: $originalSize',
+                  style: const TextStyle(color: NearLinkColors.textSecondary),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  '是否压缩图片以加快传输速度？',
+                  style: TextStyle(fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: NearLinkColors.primary.o(0.08),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.compress, size: 16, color: NearLinkColors.primary),
-                      SizedBox(width: 8),
+                      Row(
+                        children: [
+                          Icon(Icons.compress,
+                              size: 16, color: NearLinkColors.primary),
+                          SizedBox(width: 8),
+                          Text(
+                            '压缩后优势',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: NearLinkColors.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 4),
                       Text(
-                        '压缩后优势',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w600,
-                          color: NearLinkColors.primary,
-                        ),
+                        '• 传输速度提升 3-10 倍\n'
+                        '• 节省蓝牙带宽\n'
+                        '• 图片质量仍能保持良好',
+                        style: TextStyle(fontSize: 12),
                       ),
                     ],
                   ),
-                  SizedBox(height: 4),
-                  Text(
-                    '• 传输速度提升 3-10 倍\n'
-                    '• 节省蓝牙带宽\n'
-                    '• 图片质量仍能保持良好',
-                    style: TextStyle(fontSize: 12),
-                  ),
-                ],
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('不压缩'),
               ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('不压缩'),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                icon: const Icon(Icons.compress, size: 18),
+                label: const Text('压缩发送'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: NearLinkColors.primary,
+                  foregroundColor: Colors.white,
+                ),
+              ),
+            ],
           ),
-          ElevatedButton.icon(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            icon: const Icon(Icons.compress, size: 18),
-            label: const Text('压缩发送'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: NearLinkColors.primary,
-              foregroundColor: Colors.white,
-            ),
-          ),
-        ],
-      ),
-    ) ?? false;
+        ) ??
+        false;
   }
 
   String _formatFileSizeSimple(int bytes) {
@@ -1001,7 +1035,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   }
 
   /// 显示断开连接的确认对话框
-  void _showDisconnectPeripheralDialog(BuildContext context, NearLinkProvider provider) {
+  void _showDisconnectPeripheralDialog(
+      BuildContext context, NearLinkProvider provider) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(

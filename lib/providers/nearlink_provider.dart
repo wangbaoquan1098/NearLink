@@ -630,6 +630,7 @@ class NearLinkProvider extends ChangeNotifier {
     }
 
     if (transfer != null) {
+      clearSelectedFile();
       await _fileTransferService.startSend(transfer.fileId);
     }
     notifyListeners();

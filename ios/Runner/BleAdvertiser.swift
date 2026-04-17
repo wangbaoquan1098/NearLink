@@ -496,6 +496,41 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
         flushPendingDataQueueFast()
     }
 
+    private func handleCentralDisconnected(_ central: CBCentral, reason: String) {
+        let hadCentral = connectedCentrals.contains { $0.identifier == central.identifier }
+        if !hadCentral {
+            return
+        }
+
+        NSLog(
+            "[BleAdvertiser][trace] central disconnected reason=%@ central=%@",
+            reason,
+            central.identifier.uuidString
+        )
+
+        connectedCentrals.removeAll { $0.identifier == central.identifier }
+
+        if !reassemblyBuffer.isEmpty {
+            reassemblyBuffer = Data()
+        }
+        if !pendingDataQueue.isEmpty {
+            pendingDataQueue.removeAll()
+        }
+
+        emitEvent([
+            "event": "centralDisconnected",
+            "centralId": central.identifier.uuidString
+        ])
+
+        if !connectedCentrals.isEmpty {
+            return
+        }
+
+        if peripheralManager?.state == .poweredOn && !isAdvertising {
+            startAdvertising(deviceName: pendingDeviceName)
+        }
+    }
+
     /// CoreBluetooth 的 `maximumUpdateValueLength` 已经是单次 updateValue 的安全上限。
     private func maxOutgoingFragmentSize() -> Int {
         let centralLimit = connectedCentrals.map { $0.maximumUpdateValueLength }.min() ?? negotiatedMtu
@@ -521,40 +556,22 @@ class BleAdvertiser: NSObject, CBPeripheralManagerDelegate {
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
-        // 注意：取消订阅不等于断开连接，只是设备暂时不需要通知
-        // 不移除设备，因为它仍然连接着，只是暂时取消订阅
-        // 当设备重新订阅时，didSubscribeTo 会被调用
+        let remainingSubscribers = txCharacteristic?.subscribedCentrals ?? []
+        let stillSubscribed = remainingSubscribers.contains { $0.identifier == central.identifier }
+        if stillSubscribed {
+            return
+        }
+
+        // 某些系统版本上，中心设备主动断开后只会先收到取消订阅事件。
+        // 当当前 central 已不再订阅且没有其他订阅者时，提前把它视为断连，
+        // 避免 Flutter 侧长时间卡在“仍已连接”的状态。
+        if remainingSubscribers.isEmpty {
+            handleCentralDisconnected(central, reason: "unsubscribe")
+        }
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didDisconnectCentral central: CBCentral, error: Error?) {
-        // 移除断开的设备
-        connectedCentrals.removeAll { $0.identifier == central.identifier }
-
-        // 清理缓冲区，避免影响下次传输
-        if !reassemblyBuffer.isEmpty {
-            reassemblyBuffer = Data()
-        }
-        if !pendingDataQueue.isEmpty {
-            pendingDataQueue.removeAll()
-        }
-
-        // 通知 Flutter 设备断开
-        let eventData: [String: Any] = [
-            "event": "centralDisconnected",
-            "centralId": central.identifier.uuidString
-        ]
-        emitEvent(eventData)
-        
-        // 如果仍然有其他连接的设备，不需要重新广播
-        if !connectedCentrals.isEmpty {
-            return
-        }
-        
-        // 所有设备都断开了，自动重新开始广播以便接收新的连接
-        // 这样用户不需要手动重新开启广播
-        if peripheralManager?.state == .poweredOn && !isAdvertising {
-            startAdvertising(deviceName: pendingDeviceName)
-        }
+        handleCentralDisconnected(central, reason: "didDisconnect")
     }
     
     /// 发送数据到已连接的中心设备

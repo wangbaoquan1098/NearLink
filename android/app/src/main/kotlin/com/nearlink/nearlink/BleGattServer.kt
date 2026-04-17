@@ -305,6 +305,16 @@ class BleGattServer(private val context: Context) {
         }
     }
 
+    fun clearTransferBuffers(device: BluetoothDevice): Boolean {
+        return try {
+            clearNotificationState(device)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "清空传输缓冲失败: ${e.message}")
+            false
+        }
+    }
+
     private fun enqueueNotificationFragments(
         queue: ArrayDeque<ByteArray>,
         data: ByteArray,

@@ -36,6 +36,8 @@ class FileTransferService extends ChangeNotifier {
       Duration(minutes: 3);
   static const Duration _recentIncomingTransferRetention =
       Duration(seconds: 20);
+  static const Duration _postCancelSendCooldown = Duration(milliseconds: 450);
+  static const Duration _fileInfoAckRetryDelay = Duration(milliseconds: 350);
 
   StreamSubscription<NearLinkPacket>? _packetSubscription;
   Completer<bool>? _transferCompleter;
@@ -45,6 +47,7 @@ class FileTransferService extends ChangeNotifier {
   Future<void> _controlPacketSendQueue = Future.value();
   int _controlPacketQueueGeneration = 0;
   final Set<String> _cancelledTransferIds = {};
+  DateTime? _sendCooldownUntil;
   Timer? _incomingTransferWatchdog;
   static const Duration _incomingTransferStallTimeout = Duration(seconds: 6);
 
@@ -72,6 +75,31 @@ class FileTransferService extends ChangeNotifier {
 
   String _shortFileId(String fileId) =>
       fileId.length <= 8 ? fileId : fileId.substring(0, 8);
+
+  void _applySendCooldown([Duration duration = _postCancelSendCooldown]) {
+    final until = DateTime.now().add(duration);
+    if (_sendCooldownUntil == null || until.isAfter(_sendCooldownUntil!)) {
+      _sendCooldownUntil = until;
+    }
+  }
+
+  Future<void> _waitForSendCooldownIfNeeded() async {
+    final cooldownUntil = _sendCooldownUntil;
+    if (cooldownUntil == null) {
+      return;
+    }
+
+    final remaining = cooldownUntil.difference(DateTime.now());
+    if (remaining.isNegative || remaining == Duration.zero) {
+      _sendCooldownUntil = null;
+      return;
+    }
+
+    await Future.delayed(remaining);
+    if (_sendCooldownUntil == cooldownUntil) {
+      _sendCooldownUntil = null;
+    }
+  }
 
   int _batchAckIntervalFor(NearLinkPacket packet) {
     if (packet.payload.length >= NearLinkConstants.maxChunkSize) {
@@ -221,6 +249,7 @@ class FileTransferService extends ChangeNotifier {
 
   /// 开始发送文件
   Future<bool> startSend(String fileId) async {
+    await _waitForSendCooldownIfNeeded();
     _resetControlPacketQueue();
     final transfer = _activeTransfers[fileId];
     // 检查连接状态：作为 Central 连接到外设，或作为 Peripheral 被连接
@@ -654,7 +683,10 @@ class FileTransferService extends ChangeNotifier {
     }
 
     if (_bluetoothService.isPeripheralConnected) {
-      unawaited(_bluetoothService.clearPeripheralTransferBuffers());
+      final cleared = await _bluetoothService.clearPeripheralTransferBuffers();
+      if (!cleared) {
+        debugPrint('[FileTransfer] 新文件到达前清理 Peripheral 缓冲区失败');
+      }
     }
 
     final fileName = packet.metadata!['fileName'] as String;
@@ -682,20 +714,43 @@ class FileTransferService extends ChangeNotifier {
     _receivedChunks[packet.fileId] = {}; // 初始化 chunk 追踪集合
     _incomingTransferActivityAt[packet.fileId] = DateTime.now();
 
-    // 发送确认
-    await _sendControlPacketSerialized(NearLinkPacket(
+    // 发送确认。取消后立即反向发送时首个 fileInfoAck 偶发丢失，
+    // 这里做一次短延迟补发，优先保住首轮握手。
+    await _sendFileInfoAckWithRetry(packet.fileId);
+
+    // 通知 UI 有新文件开始接收
+    notifyListeners();
+  }
+
+  Future<void> _sendFileInfoAckWithRetry(String fileId) async {
+    final ackPacket = NearLinkPacket(
       type: PacketType.fileInfoAck,
-      fileId: packet.fileId,
+      fileId: fileId,
       chunkIndex: 0,
       totalChunks: 0,
       payloadSize: 0,
       checksum: '00000000',
       payload: Uint8List(0),
       timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    ));
+    );
 
-    // 通知 UI 有新文件开始接收
-    notifyListeners();
+    await _sendControlPacketSerialized(ackPacket);
+
+    Future.delayed(_fileInfoAckRetryDelay, () async {
+      final transfer = _activeTransfers[fileId];
+      if (transfer == null ||
+          transfer.isOutgoing ||
+          transfer.status != TransferStatus.transferring) {
+        return;
+      }
+
+      final hasReceivedChunks = (_receivedChunks[fileId]?.isNotEmpty ?? false);
+      if (hasReceivedChunks) {
+        return;
+      }
+
+      await _sendControlPacketSerialized(ackPacket);
+    });
   }
 
   /// 处理数据块
@@ -903,6 +958,7 @@ class FileTransferService extends ChangeNotifier {
     debugPrint(
       '[FileTransfer][trace] cancel received <- ${_shortFileId(packet.fileId)}',
     );
+    _applySendCooldown();
     _bluetoothService.deferPeerTimeout();
     _bluetoothService.clearPacketBuffer();
     _bluetoothService.abortActiveCentralWrites();
@@ -1056,6 +1112,7 @@ class FileTransferService extends ChangeNotifier {
       debugPrint(
         '[FileTransfer][trace] cancel requested -> ${_shortFileId(fileId)}',
       );
+      _applySendCooldown();
       _bluetoothService.deferPeerTimeout();
       _bluetoothService.clearPacketBuffer();
       _bluetoothService.abortActiveCentralWrites();

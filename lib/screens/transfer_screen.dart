@@ -20,6 +20,8 @@ class _TransferScreenState extends State<TransferScreen> {
   TransferStatus? _lastStatus;
   bool _lastConnectionState = true;
   ScaffoldMessengerState? _scaffoldMessenger;
+  String? _lastTransferFileId;
+  bool _isLeavingScreen = false;
 
   @override
   void didChangeDependencies() {
@@ -33,6 +35,7 @@ class _TransferScreenState extends State<TransferScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<NearLinkProvider>();
       _lastStatus = provider.currentTransfer?.status;
+      _lastTransferFileId = provider.currentTransfer?.fileId;
       _lastConnectionState =
           provider.isConnected || provider.isPeripheralConnected;
       _startProgressMonitoring();
@@ -88,6 +91,7 @@ class _TransferScreenState extends State<TransferScreen> {
       }
 
       final provider = context.read<NearLinkProvider>();
+      final transfer = provider.currentTransfer;
 
       // 检测连接断开
       final isConnected =
@@ -100,8 +104,8 @@ class _TransferScreenState extends State<TransferScreen> {
       }
       _lastConnectionState = isConnected;
 
-      if (provider.currentTransfer != null) {
-        final transfer = provider.currentTransfer!;
+      if (transfer != null) {
+        _lastTransferFileId = transfer.fileId;
 
         // 检测传输完成
         if (_lastStatus != TransferStatus.completed &&
@@ -115,14 +119,28 @@ class _TransferScreenState extends State<TransferScreen> {
           _onTransferFailed(transfer);
         }
 
+        if (_lastStatus != TransferStatus.cancelled &&
+            transfer.status == TransferStatus.cancelled) {
+          _onTransferCancelled();
+        }
+
         _lastStatus = transfer.status;
+        return;
+      }
+
+      if (_lastTransferFileId != null &&
+          _lastStatus == TransferStatus.transferring) {
+        _onTransferCancelled();
+        _lastTransferFileId = null;
+        _lastStatus = null;
       }
     });
   }
 
   /// 连接断开时的处理
   void _onConnectionLost() {
-    if (!mounted) return;
+    if (!mounted || _isLeavingScreen) return;
+    _isLeavingScreen = true;
 
     // 显示断开提示
     _scaffoldMessenger?.showSnackBar(
@@ -149,8 +167,27 @@ class _TransferScreenState extends State<TransferScreen> {
     });
   }
 
-  void _onTransferComplete(FileTransfer transfer) async {
+  void _onTransferCancelled() async {
+    if (!mounted || _isLeavingScreen) return;
+    _isLeavingScreen = true;
+
+    _scaffoldMessenger?.hideCurrentSnackBar();
+    _scaffoldMessenger?.showSnackBar(
+      const SnackBar(
+        content: Text('传输已取消'),
+        backgroundColor: NearLinkColors.error,
+        duration: Duration(milliseconds: 900),
+      ),
+    );
+
+    await Future.delayed(const Duration(milliseconds: 500));
     if (!mounted) return;
+    Navigator.of(context).maybePop();
+  }
+
+  void _onTransferComplete(FileTransfer transfer) async {
+    if (!mounted || _isLeavingScreen) return;
+    _isLeavingScreen = true;
 
     final scaffoldMessenger = _scaffoldMessenger;
     if (scaffoldMessenger == null) return;
@@ -177,7 +214,8 @@ class _TransferScreenState extends State<TransferScreen> {
   }
 
   void _onTransferFailed(FileTransfer transfer) async {
-    if (!mounted) return;
+    if (!mounted || _isLeavingScreen) return;
+    _isLeavingScreen = true;
 
     final scaffoldMessenger = _scaffoldMessenger;
     if (scaffoldMessenger == null) return;
@@ -210,7 +248,10 @@ class _TransferScreenState extends State<TransferScreen> {
       if (!mounted) return;
       scaffoldMessenger.hideCurrentSnackBar();
       Navigator.of(context).pop();
+      return;
     }
+
+    _isLeavingScreen = false;
   }
 
   @override
