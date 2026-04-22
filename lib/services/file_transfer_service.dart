@@ -36,6 +36,11 @@ class FileTransferService extends ChangeNotifier {
       Duration(minutes: 3);
   static const Duration _recentIncomingTransferRetention =
       Duration(seconds: 20);
+  static const List<Duration> _postCompleteAckRetrySchedule = [
+    Duration(milliseconds: 400),
+    Duration(milliseconds: 1200),
+    Duration(milliseconds: 2500),
+  ];
   static const Duration _postCancelSendCooldown = Duration(milliseconds: 450);
   static const Duration _fileInfoAckRetryDelay = Duration(milliseconds: 350);
 
@@ -929,6 +934,7 @@ class FileTransferService extends ChangeNotifier {
     _updateTransfer(packet.fileId, status: TransferStatus.completed);
     _rememberCompletedIncomingTransfer(packet.fileId);
     _incomingTransferActivityAt.remove(packet.fileId);
+    _scheduleTransferCompleteAckRetries(packet.fileId);
     // debugPrint('[FileTransfer] _handleTransferComplete: 状态已更新为 completed');
 
     // 在后台保存文件（不阻塞 UI）
@@ -1215,6 +1221,26 @@ class FileTransferService extends ChangeNotifier {
         timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
       ),
     );
+  }
+
+  void _scheduleTransferCompleteAckRetries(String fileId) {
+    unawaited(() async {
+      for (final delay in _postCompleteAckRetrySchedule) {
+        await Future.delayed(delay);
+
+        if (!_wasRecentlyCompletedIncomingTransfer(fileId)) {
+          return;
+        }
+
+        final isStillLinked = _bluetoothService.isPeripheralConnected ||
+            _bluetoothService.isConnected;
+        if (!isStillLinked) {
+          return;
+        }
+
+        await _sendTransferCompleteAck(fileId);
+      }
+    }());
   }
 
   Future<bool> _sendControlPacketSerialized(NearLinkPacket packet) {

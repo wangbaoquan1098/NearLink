@@ -9,6 +9,8 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.util.ArrayDeque
 import java.util.UUID
@@ -41,6 +43,7 @@ class BleGattServer(private val context: Context) {
     private val pendingNotifications = mutableMapOf<String, ArrayDeque<ByteArray>>()
     private val notificationInFlight = mutableSetOf<String>()
     private val notificationRetryCounts = mutableMapOf<String, Int>()
+    private val mainHandler = Handler(Looper.getMainLooper())
     
     // 服务添加完成信号量
     private var serviceAddLatch: java.util.concurrent.CountDownLatch? = null
@@ -59,6 +62,9 @@ class BleGattServer(private val context: Context) {
         private const val TAG = "NearLink-GATT"
         private const val MAX_NOTIFICATION_RETRY = 3
         private const val MAX_NOTIFY_ATTRIBUTE_VALUE = 500
+        private const val NEARLINK_HEADER_SIZE = 64
+        private const val PACKET_TYPE_TRANSFER_COMPLETE = 10
+        private const val PACKET_TYPE_TRANSFER_COMPLETE_ACK = 11
     }
     
     /**
@@ -477,8 +483,8 @@ class BleGattServer(private val context: Context) {
             offset: Int,
             value: ByteArray?
         ) {
-            // 如果是 RX 特征值，转发数据到 Flutter
             if (characteristic?.uuid == CHAR_RX_UUID && value != null && device != null) {
+                maybeSendNativeTransferCompleteAck(device, value)
                 connectionCallback?.onDataReceived(device, value)
             }
             
@@ -620,5 +626,54 @@ class BleGattServer(private val context: Context) {
                 deviceMtuMap[it.address] = mtu
             }
         }
+    }
+
+    private fun maybeSendNativeTransferCompleteAck(device: BluetoothDevice, value: ByteArray) {
+        if (value.size < NEARLINK_HEADER_SIZE) {
+            return
+        }
+        if (value[0].toInt() and 0xFF != PACKET_TYPE_TRANSFER_COMPLETE) {
+            return
+        }
+
+        val payloadSize = ((value[37].toInt() and 0xFF) shl 8) or
+            (value[38].toInt() and 0xFF)
+        if (payloadSize != 0) {
+            return
+        }
+
+        val ackPacket = buildTransferCompleteAckPacket(value)
+        val immediateSent = sendData(device, ackPacket)
+        Log.d(TAG, "原生补发 transferCompleteAck: device=${device.address}, immediate=$immediateSent")
+
+        val retryDelaysMs = longArrayOf(300L, 1000L)
+        for (delayMs in retryDelaysMs) {
+            mainHandler.postDelayed({
+                if (!connectedDevices.contains(device) || !subscribedDevices.contains(device)) {
+                    return@postDelayed
+                }
+                val retrySent = sendData(device, ackPacket)
+                Log.d(
+                    TAG,
+                    "原生重试 transferCompleteAck: device=${device.address}, delay=${delayMs}ms, success=$retrySent"
+                )
+            }, delayMs)
+        }
+    }
+
+    private fun buildTransferCompleteAckPacket(sourcePacket: ByteArray): ByteArray {
+        val packet = ByteArray(NEARLINK_HEADER_SIZE)
+        packet[0] = PACKET_TYPE_TRANSFER_COMPLETE_ACK.toByte()
+
+        // fileId 直接复用原包的 32 字节编码，避免 UTF-8/补零差异导致 ack 不匹配。
+        System.arraycopy(sourcePacket, 1, packet, 1, 32)
+
+        val timestamp = (System.currentTimeMillis() / 1000L).toInt()
+        packet[47] = ((timestamp shr 24) and 0xFF).toByte()
+        packet[48] = ((timestamp shr 16) and 0xFF).toByte()
+        packet[49] = ((timestamp shr 8) and 0xFF).toByte()
+        packet[50] = (timestamp and 0xFF).toByte()
+
+        return packet
     }
 }
