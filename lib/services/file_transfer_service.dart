@@ -997,17 +997,10 @@ class FileTransferService extends ChangeNotifier {
 
     try {
       // 根据平台选择保存路径
-      String directoryPath;
-      if (Platform.isAndroid) {
-        // Android: 检查并请求存储权限
-        await _requestStoragePermission();
-        // 保存到储存卡根目录的 NearLink 文件夹
-        directoryPath = '/storage/emulated/0/NearLink';
-      } else {
-        // iOS: 保存到应用 Documents 目录（不需要额外权限）
-        final appDir = await getApplicationDocumentsDirectory();
-        directoryPath = '${appDir.path}/NearLink';
-      }
+      final directoryPath = await getNearLinkDirectoryPath(
+        ensureExists: true,
+        requestPermissionIfNeeded: true,
+      );
 
       // 使用原始文件名，但清理不安全字符
       final safeFileName = _sanitizeFileName(transfer.fileName);
@@ -1083,6 +1076,65 @@ class FileTransferService extends ChangeNotifier {
       return fileName.substring(lastDot);
     }
     return '';
+  }
+
+  Future<String> getNearLinkDirectoryPath({
+    bool ensureExists = false,
+    bool requestPermissionIfNeeded = false,
+  }) async {
+    if (Platform.isAndroid) {
+      if (requestPermissionIfNeeded) {
+        await _requestStoragePermission();
+      }
+      const directoryPath = '/storage/emulated/0/NearLink';
+      if (ensureExists) {
+        final dir = Directory(directoryPath);
+        if (!dir.existsSync()) {
+          await dir.create(recursive: true);
+        }
+      }
+      return directoryPath;
+    }
+
+    final appDir = await getApplicationDocumentsDirectory();
+    final directoryPath = '${appDir.path}/NearLink';
+    if (ensureExists) {
+      final dir = Directory(directoryPath);
+      if (!dir.existsSync()) {
+        await dir.create(recursive: true);
+      }
+    }
+    return directoryPath;
+  }
+
+  Future<List<FileSystemEntity>> listSavedFiles() async {
+    final directoryPath = await getNearLinkDirectoryPath(
+      ensureExists: true,
+      requestPermissionIfNeeded: Platform.isAndroid,
+    );
+    final directory = Directory(directoryPath);
+    final entries = await directory.list().toList();
+    final files = entries.whereType<File>().toList()
+      ..sort((a, b) {
+        final aStat = a.statSync();
+        final bStat = b.statSync();
+        return bStat.modified.compareTo(aStat.modified);
+      });
+    return files;
+  }
+
+  Future<bool> deleteSavedFile(String path) async {
+    try {
+      final file = File(path);
+      if (!await file.exists()) {
+        return true;
+      }
+      await file.delete();
+      return true;
+    } catch (e) {
+      debugPrint('[FileTransfer] 删除文件失败: $e');
+      return false;
+    }
   }
 
   /// 请求存储权限（仅 Android 需要）

@@ -9,6 +9,7 @@ import '../models/nearlink_models.dart';
 import '../widgets/nearlink_widgets.dart';
 import '../bluetooth/nearlink_bluetooth_service.dart';
 import '../utils/extensions.dart';
+import 'file_browser_screen.dart';
 import 'transfer_screen.dart';
 
 /// 设备发现页面
@@ -1070,7 +1071,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   void _showSettings(BuildContext context) {
     showModalBottomSheet(
       context: context,
-      builder: (context) => Container(
+      builder: (sheetContext) => Container(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1084,6 +1085,19 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               ),
             ),
             const SizedBox(height: 16),
+            ListTile(
+              leading: const Icon(Icons.folder_open),
+              title: const Text('浏览 NearLink 文件'),
+              subtitle: const Text('打开、分享或删除已保存的文件'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const FileBrowserScreen(),
+                  ),
+                );
+              },
+            ),
             const ListTile(
               leading: Icon(Icons.info_outline),
               title: Text('关于我们'),
