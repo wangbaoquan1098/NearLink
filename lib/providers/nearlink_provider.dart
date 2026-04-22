@@ -44,6 +44,22 @@ class TransferCompleteEvent {
   });
 }
 
+class PendingSendFile {
+  final String fileName;
+  final String? filePath;
+  final Uint8List? bytes;
+  final int fileSize;
+
+  const PendingSendFile({
+    required this.fileName,
+    required this.fileSize,
+    this.filePath,
+    this.bytes,
+  });
+
+  bool get hasBytes => bytes != null;
+}
+
 /// NearLink 应用状态管理
 class NearLinkProvider extends ChangeNotifier {
   static final NearLinkProvider _instance = NearLinkProvider._internal();
@@ -66,10 +82,12 @@ class NearLinkProvider extends ChangeNotifier {
   bool _isInitializing = false; // 防止重复初始化
   bool _isDarkMode = false;
   String? _currentDeviceName;
-  String? _selectedFilePath;
-  Uint8List? _selectedFileBytes; // 用于存储从 image_picker 选择的文件字节
-  String? _selectedFileName; // 存储文件名
+  final List<PendingSendFile> _pendingSendFiles = [];
   bool _compressImages = false; // 是否压缩图片
+  bool _batchSendInProgress = false;
+  int _batchTotalCount = 0;
+  int _batchCompletedCount = 0;
+  String? _batchCurrentFileId;
 
   // 连接成功的设备信息
   NearbyDevice? _connectedRemoteDevice;
@@ -137,6 +155,21 @@ class NearLinkProvider extends ChangeNotifier {
 
   bool get isIOS => _iosAdapter.isIOS;
   NearbyDevice? get connectedRemoteDevice => _connectedRemoteDevice;
+  List<PendingSendFile> get pendingSendFiles =>
+      List.unmodifiable(_pendingSendFiles);
+  bool get hasPendingFiles => _pendingSendFiles.isNotEmpty;
+  int get batchTotalCount => _batchTotalCount;
+  int get batchCompletedCount => _batchCompletedCount;
+  int get batchRemainingCount =>
+      (_batchTotalCount - _batchCompletedCount).clamp(0, _batchTotalCount);
+  bool get isBatchSending => _batchSendInProgress;
+  bool get isMultiFileBatch => _batchTotalCount > 1;
+  double get batchOverallProgress {
+    if (_batchTotalCount <= 0) return 0;
+    final currentProgress = currentTransfer?.progress ?? 0;
+    return ((_batchCompletedCount + currentProgress) / _batchTotalCount)
+        .clamp(0.0, 1.0);
+  }
 
   // 广播相关 Getters
   AdvertisingState get advertisingState => _bluetoothService.advertisingState;
@@ -422,9 +455,40 @@ class NearLinkProvider extends ChangeNotifier {
   /// 文件传输服务状态变化回调
   void _onFileTransferChanged() {
     final activeTransfers = _fileTransferService.activeTransfers;
+    final currentOutgoing = activeTransfers.where((t) => t.isOutgoing).toList();
 
     // 1. 通知 UI 更新进度（每次状态变化都需要）
     notifyListeners();
+
+    if (_batchSendInProgress) {
+      FileTransfer? currentBatchTransfer;
+      if (_batchCurrentFileId != null) {
+        for (final transfer in activeTransfers) {
+          if (transfer.fileId == _batchCurrentFileId) {
+            currentBatchTransfer = transfer;
+            break;
+          }
+        }
+      }
+
+      if (_batchCurrentFileId != null && currentBatchTransfer == null) {
+        _batchCompletedCount =
+            (_batchCompletedCount + 1).clamp(0, _batchTotalCount);
+        _batchCurrentFileId = null;
+
+        if (_pendingSendFiles.isNotEmpty) {
+          unawaited(_startNextPendingSend(shouldCompress: _compressImages));
+        } else if (currentOutgoing.isEmpty) {
+          _batchSendInProgress = false;
+        }
+      }
+
+      if (currentOutgoing.any((t) => t.status == TransferStatus.failed)) {
+        _pendingSendFiles.clear();
+        _batchSendInProgress = false;
+        _batchCurrentFileId = null;
+      }
+    }
 
     // 2. 检查是否有新的接收中的传输，只在首次检测到时触发界面跳转
     if (activeTransfers.isNotEmpty) {
@@ -573,68 +637,125 @@ class NearLinkProvider extends ChangeNotifier {
 
   /// 选择文件
   void selectFile(String path) {
-    _selectedFilePath = path;
+    final fileName = path.split('/').last;
+    _pendingSendFiles
+      ..clear()
+      ..add(PendingSendFile(fileName: fileName, filePath: path, fileSize: 0));
     notifyListeners();
   }
 
   /// 清除选中的文件
   void clearSelectedFile() {
-    _selectedFilePath = null;
-    _selectedFileBytes = null;
-    _selectedFileName = null;
+    clearPendingFiles();
+  }
+
+  void clearPendingFiles() {
+    _pendingSendFiles.clear();
+    _batchSendInProgress = false;
+    _batchTotalCount = 0;
+    _batchCompletedCount = 0;
+    _batchCurrentFileId = null;
     notifyListeners();
   }
 
   /// 选择文件（从 image_picker 传入字节数据）
   void selectFileWithBytes(String fileName, Uint8List bytes) {
-    _selectedFileName = fileName;
-    _selectedFileBytes = bytes;
-    _selectedFilePath = null; // 使用字节数据，不使用路径
+    _pendingSendFiles
+      ..clear()
+      ..add(
+        PendingSendFile(
+          fileName: fileName,
+          bytes: bytes,
+          fileSize: bytes.length,
+        ),
+      );
+    notifyListeners();
+  }
+
+  void selectFiles(List<PendingSendFile> files) {
+    _pendingSendFiles
+      ..clear()
+      ..addAll(files);
     notifyListeners();
   }
 
   /// 检查是否有选中的文件（路径或字节）
-  bool get hasSelectedFile =>
-      _selectedFilePath != null || _selectedFileBytes != null;
+  bool get hasSelectedFile => _pendingSendFiles.isNotEmpty;
 
   /// 获取选中的文件名
-  String? get selectedFileName => _selectedFilePath != null
-      ? _selectedFilePath!.split('/').last
-      : _selectedFileName;
+  String? get selectedFileName =>
+      _pendingSendFiles.isEmpty ? null : _pendingSendFiles.first.fileName;
 
   /// 获取选中的文件字节数据
-  Uint8List? get selectedFileBytes => _selectedFileBytes;
+  Uint8List? get selectedFileBytes =>
+      _pendingSendFiles.isEmpty ? null : _pendingSendFiles.first.bytes;
 
-  /// 准备并发送文件
-  Future<FileTransfer?> sendFile({bool? compressImage}) async {
-    // 如果未指定压缩选项，使用用户设置
+  Future<FileTransfer?> _prepareTransferForPendingFile(
+    PendingSendFile pendingFile, {
+    required bool compressImage,
+  }) async {
+    if (pendingFile.hasBytes) {
+      return _fileTransferService.prepareFileWithBytes(
+        pendingFile.fileName,
+        pendingFile.bytes!,
+        compressImage: compressImage,
+      );
+    }
+    if (pendingFile.filePath != null) {
+      return _fileTransferService.prepareFile(
+        pendingFile.filePath!,
+        compressImage: compressImage,
+      );
+    }
+    return null;
+  }
+
+  Future<FileTransfer?> startPendingBatchSend({bool? compressImage}) async {
     final shouldCompress = compressImage ?? _compressImages;
+    if (_batchSendInProgress || _pendingSendFiles.isEmpty) {
+      return currentTransfer;
+    }
 
-    FileTransfer? transfer;
+    if (_batchTotalCount <= 0) {
+      _batchTotalCount = _pendingSendFiles.length;
+      _batchCompletedCount = 0;
+    }
 
-    if (_selectedFileBytes != null && _selectedFileName != null) {
-      // 使用 image_picker 传入的字节数据
-      transfer = await _fileTransferService.prepareFileWithBytes(
-        _selectedFileName!,
-        _selectedFileBytes!,
-        compressImage: shouldCompress,
-      );
-    } else if (_selectedFilePath != null) {
-      // 使用文件路径
-      transfer = await _fileTransferService.prepareFile(
-        _selectedFilePath!,
-        compressImage: shouldCompress,
-      );
-    } else {
+    _batchSendInProgress = true;
+    notifyListeners();
+    return _startNextPendingSend(shouldCompress: shouldCompress);
+  }
+
+  Future<FileTransfer?> _startNextPendingSend(
+      {required bool shouldCompress}) async {
+    if (_pendingSendFiles.isEmpty) {
+      _batchSendInProgress = false;
+      _batchCurrentFileId = null;
+      notifyListeners();
       return null;
     }
 
-    if (transfer != null) {
-      clearSelectedFile();
-      await _fileTransferService.startSend(transfer.fileId);
+    final pendingFile = _pendingSendFiles.removeAt(0);
+    final transfer = await _prepareTransferForPendingFile(
+      pendingFile,
+      compressImage: shouldCompress,
+    );
+
+    if (transfer == null) {
+      _batchSendInProgress = false;
+      notifyListeners();
+      return null;
     }
+
+    _batchCurrentFileId = transfer.fileId;
     notifyListeners();
+    await _fileTransferService.startSend(transfer.fileId);
     return transfer;
+  }
+
+  /// 准备并发送文件
+  Future<FileTransfer?> sendFile({bool? compressImage}) async {
+    return startPendingBatchSend(compressImage: compressImage);
   }
 
   /// 设置是否压缩图片
@@ -645,6 +766,9 @@ class NearLinkProvider extends ChangeNotifier {
 
   /// 取消传输
   Future<void> cancelTransfer(String fileId) async {
+    _pendingSendFiles.clear();
+    _batchSendInProgress = false;
+    _batchCurrentFileId = null;
     await _fileTransferService.cancelTransfer(fileId);
     notifyListeners();
   }

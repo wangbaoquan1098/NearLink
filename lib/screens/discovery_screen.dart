@@ -801,74 +801,29 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     try {
-      // 先清掉上一次选择结果，避免本次取消后误发旧文件。
-      provider.clearSelectedFile();
+      provider.clearPendingFiles();
+      final initialFiles = await _pickPendingFiles(provider);
+      if (!mounted || initialFiles.isEmpty) return;
 
-      PlatformFile? selectedFile;
-      bool fileFromPicker = false;
-
-      // iOS 使用 image_picker 从相册选择，Android 使用 file_picker
-      if (provider.isIOS) {
-        // iOS: 使用 image_picker 从相册选择
-        final picker = ImagePicker();
-        final pickedFile = await picker.pickImage(
-          source: ImageSource.gallery,
-        );
-
-        if (pickedFile != null) {
-          // 使用 readAsBytes 获取文件数据，避免 iOS 沙盒路径问题
-          final fileBytes = await pickedFile.readAsBytes();
-          final fileName = pickedFile.name;
-          provider.selectFileWithBytes(fileName, fileBytes);
-        } else {
-          // 用户取消相册选择，尝试 file_picker 选择其他文件
-          await Future.delayed(_iosPickerCooldown);
-          FilePickerResult? result;
-          try {
-            result = await FilePicker.platform.pickFiles(
-              type: FileType.any,
-              allowMultiple: false,
-              withData: true,
-            );
-          } on PlatformException catch (e) {
-            if (e.code == 'multiple_request') {
-              return;
-            }
-            rethrow;
-          }
-          if (result != null && result.files.isNotEmpty) {
-            selectedFile = result.files.first;
-            fileFromPicker = true;
-            provider.selectFile(selectedFile.path!);
-          }
-        }
-      } else {
-        // Android: 使用 file_picker
-        final result = await FilePicker.platform.pickFiles(
-          type: FileType.any,
-          allowMultiple: false,
-          withData: true,
-        );
-        if (result != null && result.files.isNotEmpty) {
-          selectedFile = result.files.first;
-          fileFromPicker = true;
-          provider.selectFile(selectedFile.path!);
-        }
+      final pendingFiles = await _showSendQueueSheet(initialFiles, provider);
+      if (!mounted || pendingFiles == null || pendingFiles.isEmpty) {
+        provider.clearPendingFiles();
+        return;
       }
 
-      if (!mounted || !provider.hasSelectedFile) return;
+      provider.selectFiles(pendingFiles);
 
-      final fileName = fileFromPicker
-          ? selectedFile!.name
-          : (provider.selectedFileName ?? 'photo.jpg');
-      final fileSize = fileFromPicker
-          ? selectedFile!.size
-          : (provider.selectedFileBytes?.length ?? 0);
-      final isImage = _isImageFile(fileName);
+      final totalSize =
+          pendingFiles.fold<int>(0, (sum, file) => sum + file.fileSize);
+      final largestFile = pendingFiles.reduce(
+        (a, b) => a.fileSize >= b.fileSize ? a : b,
+      );
+      final containsLargeIOSFile =
+          provider.isIOS && largestFile.fileSize > 50 * 1024 * 1024;
 
-      if (provider.isIOS && fileSize > 50 * 1024 * 1024) {
+      if (containsLargeIOSFile) {
         if (!mounted) return;
-        final advice = provider.getIosTransferAdvice(fileSize);
+        final advice = provider.getIosTransferAdvice(largestFile.fileSize);
         await showDialog<void>(
           context: context,
           builder: (dialogContext) => AlertDialog(
@@ -898,13 +853,34 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         return;
       }
 
-      if (isImage && fileSize > 100 * 1024) {
+      final largestImageFile = pendingFiles
+          .where((file) => _isImageFile(file.fileName))
+          .fold<PendingSendFile?>(
+            null,
+            (largest, file) =>
+                largest == null || file.fileSize > largest.fileSize
+                    ? file
+                    : largest,
+          );
+
+      if (largestImageFile != null && largestImageFile.fileSize > 100 * 1024) {
         if (!mounted) return;
-        final fakeFile = PlatformFile(name: fileName, size: fileSize);
-        final shouldCompress =
+        final fakeFile = PlatformFile(
+          name: pendingFiles.length > 1
+              ? '${pendingFiles.length} 个文件（共 ${_formatFileSizeSimple(totalSize)}）'
+              : largestImageFile.fileName,
+          size: largestImageFile.fileSize,
+        );
+        final compressChoice =
             await _showImageCompressionDialog(context, fakeFile);
         if (!mounted) return;
-        provider.setCompressImages(shouldCompress);
+        if (compressChoice == _CompressionChoice.cancel) {
+          provider.clearPendingFiles();
+          return;
+        }
+        provider.setCompressImages(
+          compressChoice == _CompressionChoice.compressed,
+        );
       }
 
       navigator.push(
@@ -923,6 +899,221 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     }
   }
 
+  Future<List<PendingSendFile>> _pickPendingFiles(
+    NearLinkProvider provider,
+  ) async {
+    final pendingFiles = <PendingSendFile>[];
+
+    if (provider.isIOS) {
+      final picker = ImagePicker();
+      final pickedFiles = await picker.pickMultiImage();
+
+      if (pickedFiles.isNotEmpty) {
+        for (final pickedFile in pickedFiles) {
+          final fileBytes = await pickedFile.readAsBytes();
+          pendingFiles.add(
+            PendingSendFile(
+              fileName: pickedFile.name,
+              bytes: fileBytes,
+              fileSize: fileBytes.length,
+            ),
+          );
+        }
+        return pendingFiles;
+      }
+
+      await Future.delayed(_iosPickerCooldown);
+      FilePickerResult? result;
+      try {
+        result = await FilePicker.platform.pickFiles(
+          type: FileType.any,
+          allowMultiple: true,
+          withData: true,
+        );
+      } on PlatformException catch (e) {
+        if (e.code == 'multiple_request') {
+          return pendingFiles;
+        }
+        rethrow;
+      }
+      if (result != null && result.files.isNotEmpty) {
+        pendingFiles.addAll(_pendingFilesFromPicker(result.files));
+      }
+      return pendingFiles;
+    }
+
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: true,
+      withData: false,
+    );
+    if (result != null && result.files.isNotEmpty) {
+      pendingFiles.addAll(_pendingFilesFromPicker(result.files));
+    }
+    return pendingFiles;
+  }
+
+  Future<List<PendingSendFile>?> _showSendQueueSheet(
+    List<PendingSendFile> initialFiles,
+    NearLinkProvider provider,
+  ) async {
+    return showModalBottomSheet<List<PendingSendFile>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        final selectedFiles = <PendingSendFile>[...initialFiles];
+
+        return StatefulBuilder(
+          builder: (context, setState) {
+            void addFiles(List<PendingSendFile> files) {
+              for (final file in files) {
+                final exists = selectedFiles.any(
+                  (existing) =>
+                      existing.fileName == file.fileName &&
+                      existing.fileSize == file.fileSize &&
+                      existing.filePath == file.filePath,
+                );
+                if (!exists) {
+                  selectedFiles.add(file);
+                }
+              }
+              setState(() {});
+            }
+
+            return SafeArea(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  left: 24,
+                  right: 24,
+                  top: 24,
+                  bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '待发送文件',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '已选择 ${selectedFiles.length} 个文件',
+                      style: const TextStyle(
+                        color: NearLinkColors.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 320),
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: selectedFiles.length,
+                        separatorBuilder: (context, index) =>
+                            const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final file = selectedFiles[index];
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(
+                              _isImageFile(file.fileName)
+                                  ? Icons.image
+                                  : Icons.insert_drive_file,
+                              color: NearLinkColors.primary,
+                            ),
+                            title: Text(
+                              file.fileName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              _formatFileSizeSimple(file.fileSize),
+                            ),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.close),
+                              onPressed: () {
+                                selectedFiles.removeAt(index);
+                                setState(() {});
+                              },
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: () async {
+                              final moreFiles =
+                                  await _pickPendingFiles(provider);
+                              if (moreFiles.isNotEmpty) {
+                                addFiles(moreFiles);
+                              }
+                            },
+                            icon: const Icon(Icons.add),
+                            label: const Text('继续添加'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: selectedFiles.isEmpty
+                                ? null
+                                : () => Navigator.of(sheetContext).pop(
+                                      List<PendingSendFile>.from(selectedFiles),
+                                    ),
+                            icon: const Icon(Icons.send),
+                            label: const Text('开始发送'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: NearLinkColors.primary,
+                              foregroundColor: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    TextButton(
+                      onPressed: () => Navigator.of(sheetContext).pop(),
+                      child: const Text('取消'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  List<PendingSendFile> _pendingFilesFromPicker(List<PlatformFile> files) {
+    return files
+        .where((file) => file.path != null || file.bytes != null)
+        .map((file) {
+      if (file.path != null) {
+        return PendingSendFile(
+          fileName: file.name,
+          filePath: file.path!,
+          fileSize: file.size,
+        );
+      }
+      if (file.bytes != null) {
+        return PendingSendFile(
+          fileName: file.name,
+          bytes: file.bytes,
+          fileSize: file.size,
+        );
+      }
+      throw StateError('文件既没有路径也没有字节数据');
+    }).toList();
+  }
+
   /// 判断是否为图片文件
   bool _isImageFile(String fileName) {
     final lowerName = fileName.toLowerCase();
@@ -936,13 +1127,13 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   }
 
   /// 显示图片压缩选项对话框
-  Future<bool> _showImageCompressionDialog(
+  Future<_CompressionChoice> _showImageCompressionDialog(
       BuildContext context, PlatformFile file) async {
     final originalSize = _formatFileSizeSimple(file.size);
 
-    return await showDialog<bool>(
+    return await showDialog<_CompressionChoice>(
           context: context,
-          barrierDismissible: false,
+          barrierDismissible: true,
           builder: (dialogContext) => AlertDialog(
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -1011,11 +1202,20 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(dialogContext, false),
+                onPressed: () =>
+                    Navigator.pop(dialogContext, _CompressionChoice.cancel),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                onPressed: () =>
+                    Navigator.pop(dialogContext, _CompressionChoice.original),
                 child: const Text('不压缩'),
               ),
               ElevatedButton.icon(
-                onPressed: () => Navigator.pop(dialogContext, true),
+                onPressed: () => Navigator.pop(
+                  dialogContext,
+                  _CompressionChoice.compressed,
+                ),
                 icon: const Icon(Icons.compress, size: 18),
                 label: const Text('压缩发送'),
                 style: ElevatedButton.styleFrom(
@@ -1026,7 +1226,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             ],
           ),
         ) ??
-        false;
+        _CompressionChoice.cancel;
   }
 
   String _formatFileSizeSimple(int bytes) {
@@ -1121,4 +1321,10 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       ),
     );
   }
+}
+
+enum _CompressionChoice {
+  cancel,
+  original,
+  compressed,
 }

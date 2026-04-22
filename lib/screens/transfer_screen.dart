@@ -129,7 +129,8 @@ class _TransferScreenState extends State<TransferScreen> {
       }
 
       if (_lastTransferFileId != null &&
-          _lastStatus == TransferStatus.transferring) {
+          _lastStatus == TransferStatus.transferring &&
+          !provider.isBatchSending) {
         _onTransferCancelled();
         _lastTransferFileId = null;
         _lastStatus = null;
@@ -187,13 +188,23 @@ class _TransferScreenState extends State<TransferScreen> {
 
   void _onTransferComplete(FileTransfer transfer) async {
     if (!mounted || _isLeavingScreen) return;
-    _isLeavingScreen = true;
-
+    final provider = context.read<NearLinkProvider>();
     final scaffoldMessenger = _scaffoldMessenger;
     if (scaffoldMessenger == null) return;
     scaffoldMessenger.hideCurrentSnackBar();
 
-    // 显示成功提示
+    if (provider.isBatchSending && provider.pendingSendFiles.isNotEmpty) {
+      scaffoldMessenger.showSnackBar(
+        SnackBar(
+          content: Text('已完成: ${transfer.fileName}，继续发送下一个文件'),
+          backgroundColor: NearLinkColors.success,
+          duration: const Duration(milliseconds: 900),
+        ),
+      );
+      return;
+    }
+
+    _isLeavingScreen = true;
     scaffoldMessenger.showSnackBar(
       SnackBar(
         content: Text(
@@ -263,14 +274,6 @@ class _TransferScreenState extends State<TransferScreen> {
           icon: const Icon(Icons.arrow_back),
           onPressed: () => _confirmExit(context),
         ),
-        actions: [
-          if (context.watch<NearLinkProvider>().isIOS)
-            IconButton(
-              icon: const Icon(Icons.ios_share),
-              onPressed: () => _useAirDrop(context),
-              tooltip: '使用 AirDrop',
-            ),
-        ],
       ),
       body: Selector<NearLinkProvider, bool>(
         selector: (_, provider) =>
@@ -335,6 +338,7 @@ class _TransferScreenState extends State<TransferScreen> {
             children: [
               // 连接信息
               _buildConnectionInfoStatic(context),
+              _buildBatchSummary(context),
               // 传输状态
               Expanded(
                 child: _buildTransferStatusOptimized(context),
@@ -381,6 +385,14 @@ class _TransferScreenState extends State<TransferScreen> {
       selector: (_, provider) => provider.currentTransfer,
       builder: (context, transfer, child) {
         if (transfer == null) {
+          final provider = context.read<NearLinkProvider>();
+          if (provider.isBatchSending) {
+            return const EmptyState(
+              icon: Icons.more_time,
+              title: '正在准备下一个文件',
+              description: '批量发送会按顺序自动继续',
+            );
+          }
           return const EmptyState(
             icon: Icons.file_copy_outlined,
             title: '暂无传输任务',
@@ -391,6 +403,54 @@ class _TransferScreenState extends State<TransferScreen> {
         return _TransferProgressWidget(
           key: ValueKey(transfer.fileId),
           transfer: transfer,
+        );
+      },
+    );
+  }
+
+  Widget _buildBatchSummary(BuildContext context) {
+    return Selector<NearLinkProvider,
+        ({bool visible, int total, int completed, double progress})>(
+      selector: (_, provider) => (
+        visible: provider.isMultiFileBatch,
+        total: provider.batchTotalCount,
+        completed: provider.batchCompletedCount,
+        progress: provider.batchOverallProgress,
+      ),
+      builder: (context, data, child) {
+        if (!data.visible) {
+          return const SizedBox.shrink();
+        }
+
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.folder_copy,
+                          color: NearLinkColors.primary),
+                      const SizedBox(width: 8),
+                      Text(
+                        '批量发送 ${data.completed}/${data.total}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  LinearProgressIndicator(
+                    value: data.progress,
+                    minHeight: 8,
+                    borderRadius: BorderRadius.circular(99),
+                    backgroundColor: NearLinkColors.primary.o(0.12),
+                  ),
+                ],
+              ),
+            ),
+          ),
         );
       },
     );
@@ -630,14 +690,6 @@ class _TransferScreenState extends State<TransferScreen> {
     } else {
       Navigator.pop(context);
     }
-  }
-
-  void _useAirDrop(BuildContext context) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('正在打开 AirDrop...'),
-      ),
-    );
   }
 }
 
