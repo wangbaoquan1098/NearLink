@@ -180,8 +180,8 @@ flutter test -d <device_id>
 
 ## 📞 联系方式
 
-- 邮箱: contact@nearlink.app
-- 网站: https://nearlink.app
+- 邮箱: wbq1098@163.com
+- 网站: https://nearlink.app    虚拟网址，并没有实现网站
 
 ---
 
